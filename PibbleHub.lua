@@ -672,7 +672,7 @@ O6WTRM8mn1ExjKqVYZFlkA73+VF0sen1ChVdRCvNFdsnk+VUsiT8QLIsYSRbPKo4jVZwiLSqGQDlWwZV
 
     minBox.FocusLost:Connect(function()
         local n = tonumber(minBox.Text)
-        if n then minPopFloor = math.clamp(math.floor(n), 1, MAX_FLOOR) end
+        if n then minPopFloor = math.max(1, math.floor(n)) -- no upper limit (Infinite Tower has no max floor) end
         minBox.Text = tostring(minPopFloor)
     end)
 
