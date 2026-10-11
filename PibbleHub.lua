@@ -2952,7 +2952,63 @@ local function runHub()
             return waitAccepted(since, hrp0 and hrp0.Position)
         end
 
+        -- ---- closing the Marine Dungeon window (red X) ----
+        -- The window stays open when a run is already in progress ("Run in progress at stage 122. Exit it to start a new one")
+        -- and blocks everything: it is closed with its red X, or hidden as a last resort.
+        local hiddenDungeonGui
+
+        local function dungeonDialogGui()
+            local pg = player:FindFirstChild("PlayerGui")
+            if not pg then return nil end
+            for _, d in ipairs(pg:GetDescendants()) do
+                if d:IsA("TextLabel") and not d:IsDescendantOf(gui) and shown(d) then
+                    local t = clean(d.Text):lower()
+                    if t:find("marine dungeon", 1, true) or t:find("run in progress", 1, true)
+                        or t:find("dungeon berries", 1, true) then
+                        return d:FindFirstAncestorWhichIsA("ScreenGui")
+                    end
+                end
+            end
+            return nil
+        end
+
+        local function waitDungeonDialogClosed(maxT)
+            local t0 = os.clock()
+            repeat
+                if not dungeonDialogGui() then return true end
+                task.wait(0.15)
+            until os.clock() - t0 > maxT
+            return false
+        end
+
+        local CLOSE_TEXTS = { x = true, ["×"] = true, ["✕"] = true, ["✖"] = true, close = true }
+        local function closeDungeonDialog()
+            local sg = dungeonDialogGui()
+            if not sg then return true end
+            -- 1) the red X of the window
+            for _, b in ipairs(sg:GetDescendants()) do
+                if (b:IsA("TextButton") or b:IsA("ImageButton")) and shown(b) then
+                    local n = b.Name:lower()
+                    local t = b:IsA("TextButton") and clean(b.Text):lower():match("^%s*(.-)%s*$") or ""
+                    if CLOSE_TEXTS[t] or n == "x" or n:find("close", 1, true) then
+                        print("[PibbleHub] dungeon: closing the window with " .. b:GetFullName())
+                        activateButton(b)
+                        if waitDungeonDialogClosed(1) then return true end
+                    end
+                end
+            end
+            -- 2) last resort: hide the window (given back before the next talk to the NPC)
+            print("[PibbleHub] dungeon: X button not found, hiding the window (" .. sg.Name .. ")")
+            sg.Enabled = false
+            hiddenDungeonGui = sg
+            return waitDungeonDialogClosed(1)
+        end
+
         local function startViaNPC()
+            if hiddenDungeonGui then -- give back a window we hid last time, so the game can open it again
+                pcall(function() hiddenDungeonGui.Enabled = true end)
+                hiddenDungeonGui = nil
+            end
             local npc = goToNPC()
             if not npc then return false end
             local prompt = npc:FindFirstChildWhichIsA("ProximityPrompt", true)
@@ -3005,9 +3061,14 @@ local function runHub()
                 print("[PibbleHub] dungeon: pressed " .. btnText(b) .. " (" .. b:GetFullName() .. ")")
                 activateButton(b)
             else
-                print("[PibbleHub] dungeon: no start button found after talking to the NPC")
+                print("[PibbleHub] dungeon: no start button found after talking to the NPC (run already in progress?) -> closing the window")
+                closeDungeonDialog()
             end
-            return waitAccepted(since, hrp0 and hrp0.Position)
+            local okAcc = waitAccepted(since, hrp0 and hrp0.Position)
+            -- the window must never stay open: close it whatever happened
+            task.wait(0.3)
+            closeDungeonDialog()
+            return okAcc
         end
 
         local function startDungeon()
@@ -3109,6 +3170,7 @@ local function runHub()
                 Dungeon.lastEnd = os.clock()
                 if not Raid.running then
                     statusL.Text = "Dungeon: could not start (see F9)"
+                    closeDungeonDialog()
                     print("[PibbleHub] dungeon: could not start. Look at the 'dungeon: server event' / 'buttons after talking' lines,"
                         .. " then set CFG.DUNGEON_START_REMOTE / CFG.DUNGEON_ARGS.")
                     if Tower.auto and Tower.resume then Tower.resume() end
@@ -3225,146 +3287,7 @@ end
 -- =========================================================================
 -- No embedded icon: the toggle button shows a "P". (To add one again, assign a base64 JPEG string to ICON_B64 here,
 -- or set CFG.ICON_ID to an "rbxassetid://..." image.)
-ICON_B64 = [[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]]
+ICON_B64 = ""
 
 local ok, err = xpcall(runHub, debug.traceback)
 
