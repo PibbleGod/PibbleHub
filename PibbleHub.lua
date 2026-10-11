@@ -18,14 +18,14 @@
      11b. Feature: Auto Raid (4 fights at xx:00 and xx:30, 15 min window)
      11c. Feature: Auto Dungeon (left when the raid opens, restarted after the raid)
       12. BattleEnd router + restore of the saved switches
-      13. Start-up + embedded icon (at the very bottom of the file)
+      13. Start-up (the icon was removed: the toggle button shows a "P")
 
     Every feature lives in its own do ... end block: its UI, its logic and its
     event wiring are all in one place. Features talk to each other only through
     the state tables from section 3 (Candy, Tower, Boss, Infinite, Raid).
 ]]
 
-local ICON_B64 -- base64 JPEG of the toggle-button icon, assigned at the bottom of the file
+local ICON_B64 -- base64 JPEG of the toggle-button icon (empty: the button shows a "P")
 
 local function runHub()
     -- =====================================================================
@@ -76,7 +76,7 @@ local function runHub()
         DEBUG_TIMER = true,  -- print what the game shows / sends around each boss attempt (F9 console)
         RESTORE_DELAY = 3,   -- seconds after launch before the saved switches are restored
         POP_GIVEUP_LEFT = 60, -- Infinite Tower: a wanted weather is only given up when this many seconds (or less) are left on it
-        ICON_ID = "",        -- optional: force an image, e.g. "rbxassetid://123456789" (empty = embedded icon)
+        ICON_ID = "",        -- optional: force an image, e.g. "rbxassetid://123456789" (empty = no icon, a "P" is shown)
 
         -- Auto Raid
         RAID_WORLD = "RaidWorld",   -- world id sent to TeleportToWorld
@@ -90,15 +90,15 @@ local function runHub()
         RAID_NEAR = 1500,           -- if the raid boss is closer than this many studs, we are already in the raid world (no teleport)
         RAID_RETRY_EVERY = 60,      -- Auto: new attempt every X seconds when the raid could not start (until it really starts)
         -- RAID_BOSS_POS = Vector3.new(0, 0, 0), -- optional: uncomment and set a fixed position to stand at in the raid world (overrides the detection)
-        RAID_START_TRIES = 3,       -- how many times StartRaidBattle is fired (and the game's own start button pressed) if the server does not react
+        RAID_START_TRIES = 3,       -- how many times StartRaidBattle is fired (and the game's own start button pressed) if the server does not react (fights 2-4 get 3 more tries)
         RAID_START_CHECK = 5,       -- seconds to wait for a server reaction after each try
         RAID_START_EVENTS = {"battle", "raid", "fight"}, -- a server event whose name contains one of these words = the fight was accepted
-        RAID_FIGHT_DELAY = 2,       -- seconds between the end of a fight and the next one
+        RAID_FIGHT_DELAY = 4,       -- seconds between the end of a fight and the next one
         RAID_FIGHT_TIMEOUT = 90,    -- seconds: if no BattleEnd arrives after StartRaidBattle, go on with the next fight
         RAID_MIN_FIGHT = 2,         -- seconds: a BattleEnd received sooner than this is a stale event
         RAID_WAIT_OTHERS = 120,     -- max seconds to wait for a running boss fight / candy run before the raid starts
-        RAID_SILENT_IS_COOLDOWN = true, -- true: if the boss was found but the server never reacts to StartRaidBattle, the raid is on cooldown -> this slot is skipped (no retry every minute)
-        RAID_REFUSE_WORDS = {"cooldown", "cool down", "already", "limit", "come back", "try again", "not available", "no attempts", "no more", "completed"}, -- a server text with one of these after StartRaidBattle = the raid was refused
+        RAID_SILENT_IS_COOLDOWN = false, -- no longer used: the 4 fights are ALWAYS attempted, the cooldown is read after them
+        RAID_REFUSE_WORDS = {"cooldown", "cool down", "already", "limit", "come back", "try again", "not available", "no attempts", "no more", "completed"}, -- server texts with one of these are only logged / used to read the cooldown timer after the 4 fights, they never stop the raid
         RAID_END_EVENTS = {"end", "result", "complete", "finish", "victory", "defeat"}, -- fallback: a *raid* remote (not sync/state) whose name has one of these = the fight is over
 
         -- Auto Dungeon
@@ -207,6 +207,8 @@ local function runHub()
         fightDone = false, -- the BattleEnd of the current raid fight arrived
         startedAt = 0,     -- os.clock() when the current raid fight was fired
         fights = 0,        -- fights finished in the current raid
+        slotNo = nil,      -- slot number the counter below belongs to
+        slotCount = 0,     -- fights finished in that slot (an interrupted raid continues from there)
         lastSlot = nil,    -- slot number (os.time() // RAID_INTERVAL) of the last raid, one raid per slot
         setAuto = nil,     -- set by the Raid feature (used to restore the saved switch)
         onBattleEnd = nil, -- set by the Raid feature (used by the BattleEnd router)
@@ -484,7 +486,7 @@ local function runHub()
 
     label("PibbleHub", 5, ORANGE, 20)
 
-    -- Open / collapse button (square, rounded corners): the embedded icon, or a "P"
+    -- Open / collapse button (square, rounded corners): the embedded icon if any, or a "P"
     do
         local iconId = CFG.ICON_ID
         if iconId == "" and ICON_B64 and #ICON_B64 > 100 then
@@ -2241,6 +2243,9 @@ local function runHub()
     -- 15 minutes of the slot (the timer shown in the UI). One raid = teleport to RaidWorld (skipped when
     -- we are already there), stand next to the raid boss (Workspace.NPCs.Yhwach, NPCId raid_soul_king_npc),
     -- then StartRaidBattle fired 4 times (each fight waits for its BattleEnd, or RAID_FIGHT_TIMEOUT).
+    -- Only the FIRST fight can mean "raid refused / on cooldown". Fights 2-4 are retried (a refusal text or a
+    -- silence right after a fight is just the previous fight closing). The slot is marked as done only after the
+    -- 4th fight; an interrupted raid is retried by Auto and continues from the next fight.
     -- While a raid runs, Candy / Tower / Boss / Pop are paused, and resumed right after.
     do
         label("Auto Raid", 570, ORANGE)
@@ -2530,10 +2535,14 @@ local function runHub()
 
         -- Fires StartRaidBattle until the server reacts. Try 1: remote only. Try 2+: talk to the boss and press
         -- the RaidGui Fight button too. Try 3: also any generic start button.
+        -- index = number of the fight (1-4). Only fight 1 can be "refused": for fights 2-4 a refusal text is
+        -- a late message of the previous fight and is ignored, and more tries are made.
         -- Returns true when the server accepted the fight.
-        local function launchFight()
-            for attempt = 1, CFG.RAID_START_TRIES do
-                tpToRaidBoss(8, attempt == 1) -- stay next to the boss (it may have moved / we may have respawned)
+        local function launchFight(index)
+            local tries = (index == 1) and CFG.RAID_START_TRIES or (CFG.RAID_START_TRIES + 3)
+            local loggedRefusal = false
+            for attempt = 1, tries do
+                tpToRaidBoss(8, attempt == 1 and index == 1) -- stay next to the boss (it may have moved / we may have respawned)
                 local t = os.clock()
                 Raid.startedAt = t
                 if attempt >= 2 then
@@ -2544,17 +2553,67 @@ local function runHub()
                 if attempt >= 3 then pressRaidButton() end
                 while os.clock() - t < CFG.RAID_START_CHECK do
                     if Raid.fightDone then return true end
+                    -- a "refusal" text never stops the raid: the 4 fights are always attempted,
+                    -- the cooldown timer is only read AFTER them
                     local why = refusedText(t)
-                    if why then
-                        print("[PibbleHub] raid: refused by the server: " .. why)
-                        return false, "refused"
+                    if why and not loggedRefusal then
+                        loggedRefusal = true
+                        print("[PibbleHub] raid: server text ignored (fight " .. index .. "): " .. why)
                     end
                     if accepted(t) then return true end
                     task.wait(0.2)
                 end
-                print(("[PibbleHub] raid: no server reaction (try %d/%d)"):format(attempt, CFG.RAID_START_TRIES))
+                print(("[PibbleHub] raid: no server reaction (fight %d, try %d/%d)"):format(index, attempt, tries))
+                if index > 1 then task.wait(2) end
             end
             return false, "silent"
+        end
+
+        -- "4:32", "1:02:10", "5m 30s" ... -> seconds (nil when the text holds no time)
+        local TIME_UNITS = {
+            h = 3600, hr = 3600, hrs = 3600, hour = 3600, hours = 3600,
+            m = 60, min = 60, mins = 60, minute = 60, minutes = 60,
+            s = 1, sec = 1, secs = 1, second = 1, seconds = 1,
+        }
+        local function parseSecs(text)
+            local h, m, s = text:match("(%d+):(%d+):(%d+)")
+            if h then return tonumber(h) * 3600 + tonumber(m) * 60 + tonumber(s) end
+            m, s = text:match("(%d+):(%d+)")
+            if m then return tonumber(m) * 60 + tonumber(s) end
+            local total, found = 0, false
+            for n, u in text:gmatch("(%d+)%s*(%a+)") do
+                local mult = TIME_UNITS[u]
+                if mult then
+                    total += tonumber(n) * mult
+                    found = true
+                end
+            end
+            return found and total or nil
+        end
+
+        -- Reads the raid cooldown AFTER the fights: a server text (since `since`) or a visible text of the
+        -- interface with a cooldown-like word and a time. Returns seconds, or nil when nothing is shown.
+        local function readRaidCooldown(since)
+            for _, e in ipairs(Seen.list) do
+                if e.t >= since and e.text ~= "" and (isRefusal(e.text) or e.text:find("cool", 1, true)) then
+                    local secs = parseSecs(e.text)
+                    if secs and secs > 0 then return secs end
+                end
+            end
+            local pg = player:FindFirstChild("PlayerGui")
+            if pg then
+                for _, d in ipairs(pg:GetDescendants()) do
+                    if (d:IsA("TextLabel") or d:IsA("TextButton")) and not d:IsDescendantOf(gui) and shown(d) then
+                        local t = clean(d.Text):lower()
+                        if t ~= "" and (t:find("cooldown", 1, true) or t:find("cool down", 1, true)
+                            or t:find("available in", 1, true) or t:find("come back", 1, true)) then
+                            local secs = parseSecs(t)
+                            if secs and secs > 0 then return secs end
+                        end
+                    end
+                end
+            end
+            return nil
         end
 
         -- manual = true: "Start now" button, ignores the 15 min window and the Auto switch
@@ -2565,7 +2624,7 @@ local function runHub()
                 return
             end
             Raid.running = true -- from now on every other automation is paused
-            -- (Raid.lastSlot is only set once a fight really started: a failed attempt is retried by Auto)
+            -- (Raid.lastSlot is only set once the 4 fights are done, or when the raid is refused: a failed attempt is retried by Auto)
             Raid.fights = 0
             Raid.fightStarted = false
             Raid.fightDone = false
@@ -2594,49 +2653,57 @@ local function runHub()
             local bossFound = tpToRaidBoss(40, true)
             if not bossFound then statusL.Text = "Raid: boss not found (see F9)" end
 
-            for i = 1, CFG.RAID_FIGHTS do
+            -- fights already done in this slot (an interrupted raid continues from where it stopped)
+            if Raid.slotNo ~= slotOf() then
+                Raid.slotNo = slotOf()
+                Raid.slotCount = 0
+            end
+
+            for i = Raid.slotCount + 1, CFG.RAID_FIGHTS do
                 if not manual and (not Raid.auto or not inWindow()) then break end
                 Raid.fightDone = false
                 Raid.fightStarted = true
                 statusL.Text = ("Raid: starting fight %d/%d"):format(i, CFG.RAID_FIGHTS)
-                local okFight, why = launchFight()
+                local okFight, why = launchFight(i)
                 if not okFight then
-                    Raid.fightStarted = false
-                    if why == "refused" or (CFG.RAID_SILENT_IS_COOLDOWN and bossFound) then
-                        -- the raid is on cooldown / already done: skip this slot (also saved, so a relaunch does not retry)
-                        Raid.lastSlot = slotOf()
-                        Settings.save()
-                        statusL.Text = "Raid: on cooldown, skipped until next slot"
-                        print("[PibbleHub] raid: " .. (why == "refused" and "refused by the server" or "no reaction from the server")
-                            .. " -> slot skipped. Look at the 'raid: server event' lines above if this is wrong.")
-                    else
-                        statusL.Text = ("Raid: fight %d not accepted (see F9)"):format(i)
-                        print("[PibbleHub] raid: the server never reacted to StartRaidBattle (boss not found?). Check the 'server event' lines above:"
-                            .. " if the game does answer, add a word of that remote's name to CFG.RAID_START_EVENTS.")
-                    end
-                    break
+                    -- no recognised reaction from the server: the fight is assumed to have started anyway
+                    -- (the game may answer with an event name we do not know). We wait for its end like any other.
+                    print("[PibbleHub] raid: fight " .. i .. " not confirmed by the server, assuming it started and waiting for its end."
+                        .. " (If the game does answer, add a word of that remote's name to CFG.RAID_START_EVENTS.)")
+                    Raid.fightStarted = true
                 end
                 statusL.Text = ("Raid: fight %d/%d"):format(i, CFG.RAID_FIGHTS)
-                if Raid.lastSlot ~= slotOf() then
-                    Raid.lastSlot = slotOf() -- the raid really started: only one raid per slot (saved)
-                    Settings.save()
-                end
 
                 -- wait for the end of the fight (BattleEnd), or the timeout, or the end of the window
                 local t = os.clock()
-                while not Raid.fightDone and os.clock() - t < CFG.RAID_FIGHT_TIMEOUT do
+                local finished = false
+                while os.clock() - t < CFG.RAID_FIGHT_TIMEOUT do
+                    if Raid.fightDone then finished = true break end
                     if not manual and (not Raid.auto or not inWindow()) then break end
                     task.wait(0.25)
                 end
+                if not finished and os.clock() - t >= CFG.RAID_FIGHT_TIMEOUT then
+                    finished = true -- timeout: the fight is considered over, go on
+                    print("[PibbleHub] raid: fight " .. i .. " timeout (no BattleEnd received)")
+                end
                 Raid.fightStarted = false
+                if finished then
+                    Raid.slotCount = i
+                    if i >= CFG.RAID_FIGHTS and Raid.lastSlot ~= slotOf() then
+                        Raid.lastSlot = slotOf() -- the 4 fights are done: one raid per slot (saved)
+                        Settings.save()
+                    end
+                end
                 task.wait(CFG.RAID_FIGHT_DELAY)
             end
 
             Raid.fightStarted = false
             Raid.running = false
-            if not statusL.Text:find("not accepted", 1, true) and not statusL.Text:find("cooldown", 1, true) then
-                statusL.Text = ("Raid: done (%d/%d fights)"):format(Raid.fights, CFG.RAID_FIGHTS)
-            end
+            -- the 4 fights are over: NOW read the cooldown timer the game shows / sends
+            local cd = readRaidCooldown(t0)
+            statusL.Text = ("Raid: done (%d/%d fights)%s"):format(Raid.slotCount or 0, CFG.RAID_FIGHTS,
+                cd and (" | cooldown " .. mmss(cd)) or "")
+            if cd then print("[PibbleHub] raid: cooldown after the fights: " .. cd .. "s") end
 
             -- resume what was paused: tower and boss queue restart by themselves,
             -- otherwise (only candy / nothing) go back to the lobby
@@ -2692,7 +2759,7 @@ local function runHub()
         end
 
         -- every second: timer + start of the raid at the beginning of each slot
-        -- (if the raid could not start, Auto tries again every RAID_RETRY_EVERY seconds during the window)
+        -- (if the raid could not start / was interrupted, Auto tries again every RAID_RETRY_EVERY seconds during the window)
         local lastTry = -1e9
         task.spawn(function()
             while gui.Parent do
@@ -3154,11 +3221,10 @@ local function runHub()
 end
 
 -- =========================================================================
--- == 13. START-UP + EMBEDDED ICON
+-- == 13. START-UP
 -- =========================================================================
--- Puppy icon (base64 JPEG). It is written to a local file and loaded with getcustomasset.
--- Optional. To change the icon, replace ONLY the base64 text (the long line starting with /9j/) between the
--- two double brackets below. Left empty, the toggle button simply shows a "P" instead of the icon.
+-- No embedded icon: the toggle button shows a "P". (To add one again, assign a base64 JPEG string to ICON_B64 here,
+-- or set CFG.ICON_ID to an "rbxassetid://..." image.)
 ICON_B64 = [[/9j/4AAQSkZJRgABAQAAAQABAAD/2wCEAAkGBwgICggICAgICAgICRYGCQkJCRsICQYWIB0iIiAdHx8kKC0sJCYxJx8fLT8tMTUw
 Mz0zIyszRj8sNy0tLisBCgoKDQ0NDg0NDysZFRkrKystKysrKysrKysrLSsrKysrKysrKysrKysrKysrKysrKysrKy0rKy0tKysr
 KysrK//AABEIAPAA8AMBIgACEQEDEQH/xAAcAAACAgMBAQAAAAAAAAAAAAADBAIFAQYHAAj/xABBEAACAQMCBAMFBgQEBgEFAAAB
@@ -3298,8 +3364,7 @@ BTcbr1xuBeq+WH3jYgHtcECreXSljkwS3o1yaSniCk2w+exFBVmy7EDzqDKBeS0ZPYuueFOsF90Yufpa
 dm2BjQgr86Ubwt7l2dIi+6qxyZas0LAFt4R0wjsDXiMRxXRsfInnf50WWkYPDQWPEe8cYDMD+MijyuDeYkm44AwjsYxTmm1sJDpC
 i8Z9hxGuI6U100gIVAnSx7AGjXCzAkSYngyGPCNX5mdfP40xpo5Jkhi05ZSNpCxxwNShjwCySI0rOOITfdPQUeI5ZYZRoeYZdVNF
 O6WTRM8mn1ExjKqVYZFlkA73+VF0sen1ChVdRCvNFdsnk+VUsiT8QLIsYSRbPKo4jVZwiLSqGQDlWwZV5x8aBiSRppArKbpyLsSh
-9bUQtZbS6lA492KOMKxpMLHNjJLrCm9wpaxX6VYeFaU6p+Bo4U1bA3uouPqd6nU8Ov/Z
-]]
+9bUQtZbS6lA492KOMKxpMLHNjJLrCm9wpaxX6VYeFaU6p+Bo4U1bA3uouPqd6nU8Ov/Z]]
 
 local ok, err = xpcall(runHub, debug.traceback)
 
