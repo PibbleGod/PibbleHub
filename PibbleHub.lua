@@ -60,6 +60,11 @@ local function runHub()
         BOSS_MIN_FIGHT = 5,  -- seconds: a BattleEnd received sooner than this is a stale event of the previous fight
         TIMER_CHECK_DELAY = 3.5, -- seconds after StartNPCBattle during which a "cooldown" answer is looked for
         TIMER_MARGIN = 2,    -- seconds added to a detected timer before trying that boss again
+        RESYNC_SECS = 300,   -- the NPC dialog (timers of every difficulty) is read once per boss, then again only after this many seconds
+        DIFF_DELAY = 0.8,    -- seconds to wait after SetNPCDifficulty (raise it if a fight starts on the wrong difficulty)
+        BOSS_DELAY = 1,      -- seconds between the end of a boss fight and the next one
+        WIN_COOLDOWN = 600,  -- seconds a boss + difficulty stays on cooldown after a WIN (the dialog corrects it with the real timer on the next visit)
+        COOLDOWN_BY_NPC = { hw_seras_integra = 300 }, -- NPCs whose cooldown is not WIN_COOLDOWN (seconds), e.g. hw_walter = 300
         UNKNOWN_COOLDOWN = 600, -- seconds a boss is put aside when the server refused it without telling the timer
         REFUSE_IF_SILENT = true, -- true: if the server sends NOTHING back after StartNPCBattle, the fight is treated as refused (cooldown)
         IGNORE_REMOTES = { CandyState = true }, -- server events that don't count as an "answer" (they fire all the time)
@@ -581,7 +586,7 @@ local function runHub()
                     return t:find("teleport", 1, true) ~= nil or t == "world" or t == "worlds"
                 end)
                 if m and activateButton(m) then
-                    task.wait(0.6)
+                    task.wait(0.35)
                     card, id = findCard(name)
                 end
             end
@@ -593,7 +598,7 @@ local function runHub()
             end
             local b = card and enterButton(card)
             if b and activateButton(b) then
-                task.wait(0.6)
+                task.wait(0.35)
                 confirmDialog()
                 return "button"
             end
@@ -1204,6 +1209,11 @@ local function runHub()
             return r ~= nil and r > os.time()
         end
 
+        -- how long a boss stays on cooldown after a win
+        local function winCooldown(id)
+            return CFG.COOLDOWN_BY_NPC[id] or CFG.WIN_COOLDOWN
+        end
+
         -- next fight to run, skipping the ones that are on a cooldown timer (nil = nothing available now)
         local function peekFight()
             local list = fightList()
@@ -1237,7 +1247,11 @@ local function runHub()
 
         -- ---- NPC lookup & teleport ----
         -- Finds the NPC model in the workspace (by model name or by attribute)
+        local npcCache = {} -- id -> model (a full workspace scan is slow, so a found NPC is remembered)
         local function findNPC(id)
+            local c = npcCache[id]
+            if c and c.Parent and c:IsDescendantOf(workspace) then return c end
+            npcCache[id] = nil
             local want, wantNice = id:lower(), niceName(id):lower()
             for _, d in ipairs(workspace:GetDescendants()) do
                 if d:IsA("Model") and not Players:GetPlayerFromCharacter(d) then
@@ -1245,6 +1259,7 @@ local function runHub()
                     local a = d:GetAttribute("NPCId") or d:GetAttribute("NpcId") or d:GetAttribute("npcId")
                         or d:GetAttribute("Id") or d:GetAttribute("id")
                     if n == want or n == wantNice or (a and tostring(a):lower() == want) then
+                        npcCache[id] = d
                         return d
                     end
                 end
@@ -1253,7 +1268,7 @@ local function runHub()
 
         -- Teleports in front of the NPC (retries for ~5 s in case it is streamed in)
         local function tpToNPC(id)
-            for _ = 1, 10 do
+            for _ = 1, 25 do
                 local hrp = getHRP()
                 local m = findNPC(id)
                 if hrp and m then
@@ -1263,7 +1278,7 @@ local function runHub()
                         return true
                     end
                 end
-                task.wait(0.5)
+                task.wait(0.2)
             end
             print("[PibbleHub] NPC not found in workspace:", id)
             return false
@@ -1486,49 +1501,203 @@ local function runHub()
         end
 
         -- the 5 difficulty buttons of the open dialog -> {normal = secs, medium = secs, ...} (0 = available)
-        local function readDialogDiffs()
-            local pg = player:FindFirstChild("PlayerGui")
-            if not pg then return nil end
-            local groups = {}
-            for _, b in ipairs(pg:GetDescendants()) do
-                if b:IsA("TextButton") and not b:IsDescendantOf(gui) and shown(b) and b.Parent then
-                    groups[b.Parent] = groups[b.Parent] or {}
-                    table.insert(groups[b.Parent], b)
+        local isDiffName = toValidSet(DIFFS)
+        local dialogGrp -- container of the 5 difficulty buttons found last time (checked first: no full scan)
+
+        -- the 5 difficulty buttons of one container -> {normal = secs, medium = secs, ...} (0 = available), or nil
+        local function readGroup(parent)
+            local btns = {}
+            for _, b in ipairs(parent:GetChildren()) do
+                if b:IsA("TextButton") and shown(b) then btns[#btns + 1] = b end
+            end
+            if #btns < #DIFFS then return nil end
+            table.sort(btns, function(x, y) return x.AbsolutePosition.X < y.AbsolutePosition.X end)
+            local res = {}
+            for i, d in ipairs(DIFFS) do
+                local t = clean(btns[i].Text):lower():match("^%s*(.-)%s*$")
+                if isDiffName[t] then
+                    res[d] = 0
+                elseif parseTime(t) then
+                    res[d] = parseTime(t)
+                else
+                    return nil
                 end
             end
-            local isDiff = toValidSet(DIFFS)
-            for _, btns in pairs(groups) do
-                if #btns >= #DIFFS then
-                    table.sort(btns, function(a, b) return a.AbsolutePosition.X < b.AbsolutePosition.X end)
-                    local res, ok = {}, true
-                    for i, d in ipairs(DIFFS) do
-                        local t = clean(btns[i].Text):lower():match("^%s*(.-)%s*$")
-                        if isDiff[t] then
-                            res[d] = 0
-                        elseif parseTime(t) then
-                            res[d] = parseTime(t)
-                        else
-                            ok = false
-                            break
-                        end
-                    end
-                    if ok then return res end
+            return res
+        end
+
+        -- returns the 5 difficulty timers of the open dialog and their container (nil when no dialog is open)
+        local function readDialogDiffs()
+            if dialogGrp and dialogGrp.Parent then
+                local res = readGroup(dialogGrp)
+                if res then return res, dialogGrp end
+            end
+            local pg = player:FindFirstChild("PlayerGui")
+            if not pg then return nil end
+            local parents = {}
+            for _, b in ipairs(pg:GetDescendants()) do
+                if b:IsA("TextButton") and b.Parent and not b:IsDescendantOf(gui) and shown(b) then
+                    parents[b.Parent] = true
+                end
+            end
+            for parent in pairs(parents) do
+                local res = readGroup(parent)
+                if res then
+                    dialogGrp = parent
+                    return res, parent
                 end
             end
             return nil
         end
 
+        -- is the dialog still open? (cheap when its container is known)
+        local function dialogOpen()
+            if dialogGrp and dialogGrp.Parent then return readGroup(dialogGrp) ~= nil end
+            return readDialogDiffs() ~= nil
+        end
+
+        -- ---- closing the dialog ----
+        -- Not every NPC has an "I'm not ready." button (e.g. Seras Integra), and an open dialog blocks the fight.
+        -- 1) press a close-like button of the dialog's own gui  2) press any "not ready" button
+        -- 3) last resort: hide the dialog frame (given back before the next talk)
+        local CLOSE_WORDS = {"not ready", "not tonight", "goodbye", "bye", "leave", "later", "never mind", "nevermind", "no thanks"}
+        local CLOSE_EXACT = {x = true, ["×"] = true, ["✕"] = true, close = true}
+        local ACCEPT_WORDS = {"i'll go", "ill go", "let's go", "lets go", "fight", "start", "yes", "accept"} -- would START the fight: never pressed
+        local hiddenDialog
+
+        local function isAcceptText(t)
+            for _, w in ipairs(ACCEPT_WORDS) do
+                if t:find(w, 1, true) then return true end
+            end
+            return false
+        end
+
+        local function isCloseText(t)
+            if CLOSE_EXACT[t] then return true end
+            for _, w in ipairs(CLOSE_WORDS) do
+                if t:find(w, 1, true) then return true end
+            end
+            return false
+        end
+
+        -- waits until the dialog is gone (checks every 0.15 s instead of a fixed pause)
+        local function waitClosed(maxT)
+            local t0 = os.clock()
+            repeat
+                if not dialogOpen() then return true end
+                task.wait(0.15)
+            until os.clock() - t0 > maxT
+            return false
+        end
+
+        local function closeDialog(grp)
+            local sg = grp and grp:FindFirstAncestorWhichIsA("ScreenGui")
+            if sg and CFG.DEBUG_TIMER then
+                local out = {}
+                for _, b in ipairs(sg:GetDescendants()) do
+                    if b:IsA("TextButton") and shown(b) and b.Parent ~= grp then
+                        out[#out + 1] = b.Name .. "=" .. clean(b.Text)
+                    end
+                end
+                print("[PibbleHub] dialog gui '" .. sg.Name .. "', other buttons: " .. (#out > 0 and table.concat(out, " | ") or "(none)"))
+            end
+            -- 1) close-like button inside the dialog's gui
+            if sg then
+                for _, b in ipairs(sg:GetDescendants()) do
+                    if b:IsA("TextButton") and shown(b) and b.Parent ~= grp
+                        and not isAcceptText(clean(b.Text):lower())
+                        and isCloseText(clean(b.Text):lower():match("^%s*(.-)%s*$")) then
+                        if activateButton(b) then break end
+                    end
+                end
+                if waitClosed(0.8) then return true end
+            end
+            -- 1b) every NPC has its own decline text ("I'm not ready.", ...): press the choice button(s)
+            -- shown just under the difficulty buttons, whatever they say
+            do
+                local pg = player:FindFirstChild("PlayerGui")
+                local bottom, left, right = nil, math.huge, 0
+                for _, b in ipairs(grp:GetChildren()) do
+                    if b:IsA("TextButton") and shown(b) then
+                        bottom = math.max(bottom or 0, b.AbsolutePosition.Y + b.AbsoluteSize.Y)
+                        left = math.min(left, b.AbsolutePosition.X)
+                        right = math.max(right, b.AbsolutePosition.X + b.AbsoluteSize.X)
+                    end
+                end
+                if pg and bottom then
+                    local midX, cands = (left + right) / 2, {}
+                    for _, b in ipairs(pg:GetDescendants()) do
+                        if b:IsA("TextButton") and shown(b) and b.Parent ~= grp and not b:IsDescendantOf(gui)
+                            and clean(b.Text):match("%S") and not isAcceptText(clean(b.Text):lower()) then
+                            local p, sz = b.AbsolutePosition, b.AbsoluteSize
+                            if p.Y >= bottom - 4 and p.Y <= bottom + 120 and math.abs(p.X + sz.X / 2 - midX) <= 450 then
+                                cands[#cands + 1] = b
+                            end
+                        end
+                    end
+                    table.sort(cands, function(a, b)
+                        local ca, cb = isCloseText(clean(a.Text):lower()), isCloseText(clean(b.Text):lower())
+                        if ca ~= cb then return ca end -- close-like buttons first
+                        if a.AbsolutePosition.Y ~= b.AbsolutePosition.Y then return a.AbsolutePosition.Y < b.AbsolutePosition.Y end
+                        return a.AbsolutePosition.X < b.AbsolutePosition.X
+                    end)
+                    for i = 1, math.min(2, #cands) do
+                        if CFG.DEBUG_TIMER then print("[PibbleHub] dialog choice button: " .. clean(cands[i].Text)) end
+                        if activateButton(cands[i]) then
+                            if waitClosed(0.8) then return true end
+                        end
+                    end
+                end
+            end
+            -- 2) any "not ready" button of the interface
+            local nr = findButton(function(t)
+                for _, w in ipairs(CLOSE_WORDS) do
+                    if t:find(w, 1, true) then return true end
+                end
+                return false
+            end)
+            if nr and activateButton(nr) then
+                if waitClosed(0.8) then return true end
+            end
+            -- 3) hide the dialog frame
+            if sg then
+                local top = grp
+                while top.Parent and top.Parent ~= sg do top = top.Parent end
+                if top:IsA("GuiObject") then
+                    top.Visible = false
+                    hiddenDialog = top
+                else
+                    sg.Enabled = false
+                    hiddenDialog = sg
+                end
+                if waitClosed(0.8) then return true end
+            end
+            print("[PibbleHub] could not close the NPC dialog")
+            return false
+        end
+
         -- Opens the dialog, stores the cooldown of every difficulty of this NPC, closes the dialog.
         -- Returns true when the dialog could be read.
+        local syncedAt = {} -- id -> os.time() of the last dialog read
+        local setDiff = {}  -- id -> difficulty last sent with SetNPCDifficulty (no wait when it did not change)
         local function syncTimers(id)
+            -- already read recently: the stored cooldowns (dialog + wins) are up to date, no need to talk again
+            if syncedAt[id] and os.time() - syncedAt[id] < CFG.RESYNC_SECS then return true end
             for _ = 1, 2 do
+                if hiddenDialog then -- give back a dialog we hid last time, so the game can open it again
+                    pcall(function()
+                        if hiddenDialog:IsA("ScreenGui") then hiddenDialog.Enabled = true else hiddenDialog.Visible = true end
+                    end)
+                    hiddenDialog = nil
+                end
                 local prompt = findTalkPrompt(id)
                 if prompt and firePrompt(prompt) then
-                    local res, t0 = nil, os.clock()
+                    task.wait(0.15) -- let the dialog open and its buttons refresh (a stale one would show old timers)
+                    local res, grp, t0 = nil, nil, os.clock()
                     while os.clock() - t0 < 3 do
-                        res = readDialogDiffs()
+                        res, grp = readDialogDiffs()
                         if res then break end
-                        task.wait(0.3)
+                        task.wait(0.15)
                     end
                     if res then
                         local now, out = os.time(), {}
@@ -1546,13 +1715,12 @@ local function runHub()
                         if CFG.DEBUG_TIMER then
                             print("[PibbleHub] dialog timers " .. id .. ": " .. table.concat(out, " | "))
                         end
-                        local close = findButton(function(t) return t:find("not ready", 1, true) ~= nil end)
-                        if close then activateButton(close) end
-                        task.wait(0.4)
+                        syncedAt[id] = os.time()
+                        closeDialog(grp)
                         return true
                     end
                 end
-                task.wait(0.5)
+                task.wait(0.3)
             end
             print("[PibbleHub] could not read the dialog of " .. id)
             return false
@@ -1572,7 +1740,7 @@ local function runHub()
             advance()
             statusL.Text = ("Boss: %s %s %d:%02d"):format(niceName(id), estimated and "refused, retry in" or "on timer", secs // 60, secs % 60)
             if Boss.auto then
-                task.delay(1, function()
+                task.delay(0.2, function()
                     if Boss.auto and gui.Parent and not Boss.active then nextBoss() end
                 end)
             end
@@ -1598,15 +1766,16 @@ local function runHub()
 
             Boss.timerWait = true
             task.spawn(function()
-                local wentLobby = false
+                local wentLobby, lastTry = false, 0
                 while Boss.auto and gui.Parent and not Boss.active do
                     local s = soonest()
                     if not s or s <= 0 then break end
                     s = math.ceil(s)
                     statusL.Text = ("Boss: all on timer, %d:%02d"):format(s // 60, s % 60)
-                    if not wentLobby then
-                        wentLobby = true
-                        if Candy.goLobby then pcall(Candy.goLobby) end
+                    if not wentLobby and Candy.goLobby and os.clock() - lastTry > 20 then
+                        lastTry = os.clock()
+                        local okL, inL = pcall(Candy.goLobby)
+                        wentLobby = okL and inL == true -- not there yet: try again in 20 s
                     end
                     task.wait(1)
                 end
@@ -1635,10 +1804,10 @@ local function runHub()
                     return false
                 end
                 -- wait (up to ~15 s) for the world to load and its NPC to appear
-                for _ = 1, 30 do
-                    task.wait(0.5)
+                for _ = 1, 60 do
+                    task.wait(0.25)
                     if findNPC(id) then
-                        task.wait(1)
+                        task.wait(0.4)
                         return true
                     end
                 end
@@ -1684,7 +1853,7 @@ local function runHub()
                 end
                 return
             end
-            task.wait(0.3)
+            task.wait(0.1)
 
             -- 1) talk to the NPC and read the timer of EVERY difficulty (each one has its own cooldown)
             local synced = syncTimers(id)
@@ -1696,8 +1865,11 @@ local function runHub()
 
             -- 2) set the difficulty, like the game's own menu does
             if Remotes.SetNPCDiff then
+                local changed = setDiff[id] ~= diff
                 Remotes.SetNPCDiff:FireServer(id, diff)
-                task.wait(1.5) -- leave the server time to apply it, otherwise the fight starts on the old difficulty
+                setDiff[id] = diff
+                -- the server needs a moment to apply a NEW difficulty, otherwise the fight starts on the old one
+                if changed then task.wait(CFG.DIFF_DELAY) end
             end
 
             -- fallback when the dialog could not be read: the timer above the NPC (only if TRUST_NPC_TIMER)
@@ -1784,12 +1956,19 @@ local function runHub()
                 Boss.retries += 1
                 statusL.Text = ("Boss: lost, retry %d/%d"):format(Boss.retries, CFG.BOSS_RETRIES)
             else
+                -- a win starts the cooldown of that boss + difficulty: remember it, so the rotation
+                -- does not come back to it before it is over (saved to the file)
+                local cur = Boss.current
+                if cur and not LOSS[tostring(data.result):lower()] then
+                    Boss.cooldown[keyOf(cur)] = os.time() + winCooldown(cur[1])
+                    Settings.save()
+                end
                 advance() -- move to the next fight only now that this one is really over
                 statusL.Text = ("Boss: %s"):format(tostring(data.result))
             end
             logEnd("boss", data)
             if Boss.auto then
-                task.delay(CFG.AUTO_DELAY, function()
+                task.delay(CFG.BOSS_DELAY, function()
                     if Boss.auto and gui.Parent and not Boss.active then nextBoss() end
                 end)
             end
