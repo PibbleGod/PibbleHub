@@ -15,12 +15,14 @@
        9. Feature: Halloween Tower
       10. Feature: Auto Boss
       11. Feature: Infinite Tower (auto give up when a weather appears)
+     11b. Feature: Auto Raid (4 fights at xx:00 and xx:30, 15 min window)
+     11c. Feature: Auto Dungeon (left when the raid opens, restarted after the raid)
       12. BattleEnd router + restore of the saved switches
       13. Start-up + embedded icon (at the very bottom of the file)
 
     Every feature lives in its own do ... end block: its UI, its logic and its
     event wiring are all in one place. Features talk to each other only through
-    the state tables from section 3 (Candy, Tower, Boss, Infinite).
+    the state tables from section 3 (Candy, Tower, Boss, Infinite, Raid).
 ]]
 
 local ICON_B64 -- base64 JPEG of the toggle-button icon, assigned at the bottom of the file
@@ -44,8 +46,10 @@ local function runHub()
         Teleport = R:WaitForChild("TeleportToWorld", 5),    -- :FireServer("lobby")
         SetNPCDiff = R:WaitForChild("SetNPCDifficulty", 5), -- :FireServer("hw_alucard_anderson", "impossible")
         StartNPC = R:WaitForChild("StartNPCBattle", 5),     -- :FireServer("boss_rimuru")
+        StartRaid = R:WaitForChild("StartRaidBattle", 5),   -- :FireServer()  (Auto Raid)
     }
     local player = Players.LocalPlayer
+    print("[PibbleHub] loading...")
 
     -- =====================================================================
     -- == 2. CONFIG & STATIC DATA
@@ -71,7 +75,44 @@ local function runHub()
         TRUST_NPC_TIMER = false, -- true: also use the timer written above the NPC (it is NOT per difficulty, so it is off). The real per-difficulty timers are read from the NPC dialog
         DEBUG_TIMER = true,  -- print what the game shows / sends around each boss attempt (F9 console)
         RESTORE_DELAY = 3,   -- seconds after launch before the saved switches are restored
+        POP_GIVEUP_LEFT = 60, -- Infinite Tower: a wanted weather is only given up when this many seconds (or less) are left on it
         ICON_ID = "",        -- optional: force an image, e.g. "rbxassetid://123456789" (empty = embedded icon)
+
+        -- Auto Raid
+        RAID_WORLD = "RaidWorld",   -- world id sent to TeleportToWorld
+        RAID_FIGHTS = 4,            -- fights launched per raid
+        RAID_INTERVAL = 30 * 60,    -- a raid slot every 30 min (xx:00 and xx:30, real clock)
+        RAID_WINDOW = 15 * 60,      -- the raid can be done during the first 15 min of each slot
+        RAID_TP_TIMEOUT = 25,       -- max seconds to wait for the teleport to RaidWorld to really happen (the character moves)
+        RAID_LOAD_DELAY = 4,        -- extra seconds to let the raid world finish loading once we are there
+        RAID_NPC_ID = "raid_soul_king_npc",        -- NPCId attribute of the raid boss (Workspace.NPCs.Yhwach)
+        RAID_BOSS_NAMES = {"Yhwach", "Soul King"}, -- accepted model names / billboard texts (spaces, case and _ are ignored)
+        RAID_NEAR = 1500,           -- if the raid boss is closer than this many studs, we are already in the raid world (no teleport)
+        RAID_RETRY_EVERY = 60,      -- Auto: new attempt every X seconds when the raid could not start (until it really starts)
+        -- RAID_BOSS_POS = Vector3.new(0, 0, 0), -- optional: uncomment and set a fixed position to stand at in the raid world (overrides the detection)
+        RAID_START_TRIES = 3,       -- how many times StartRaidBattle is fired (and the game's own start button pressed) if the server does not react
+        RAID_START_CHECK = 5,       -- seconds to wait for a server reaction after each try
+        RAID_START_EVENTS = {"battle", "raid", "fight"}, -- a server event whose name contains one of these words = the fight was accepted
+        RAID_FIGHT_DELAY = 2,       -- seconds between the end of a fight and the next one
+        RAID_FIGHT_TIMEOUT = 90,    -- seconds: if no BattleEnd arrives after StartRaidBattle, go on with the next fight
+        RAID_MIN_FIGHT = 2,         -- seconds: a BattleEnd received sooner than this is a stale event
+        RAID_WAIT_OTHERS = 120,     -- max seconds to wait for a running boss fight / candy run before the raid starts
+        RAID_SILENT_IS_COOLDOWN = true, -- true: if the boss was found but the server never reacts to StartRaidBattle, the raid is on cooldown -> this slot is skipped (no retry every minute)
+        RAID_REFUSE_WORDS = {"cooldown", "cool down", "already", "limit", "come back", "try again", "not available", "no attempts", "no more", "completed"}, -- a server text with one of these after StartRaidBattle = the raid was refused
+        RAID_END_EVENTS = {"end", "result", "complete", "finish", "victory", "defeat"}, -- fallback: a *raid* remote (not sync/state) whose name has one of these = the fight is over
+
+        -- Auto Dungeon
+        DUNGEON_NPC = "DungeonNPC",   -- name of the dungeon NPC model (Workspace.NPCs.DungeonNPC, prompt "Talk", "Marine Dungeon")
+        DUNGEON_START_REMOTE = "",    -- optional: exact name of the remote that starts the dungeon (empty = auto-detect *dungeon* + start/enter/join)
+        DUNGEON_LEAVE_REMOTE = "",    -- optional: exact name of the remote that leaves the dungeon (empty = auto-detect *dungeon* + leave/exit/quit)
+        DUNGEON_ARGS = {},            -- optional: arguments sent with the start remote, e.g. {"marine_dungeon"}
+        DUNGEON_LEAVE_ARGS = {},      -- optional: arguments sent with the leave remote
+        DUNGEON_START_TRIES = 2,      -- how many times the start is attempted (remote, then NPC) before giving up
+        DUNGEON_START_CHECK = 6,      -- seconds to wait for a server reaction / a teleport after each attempt
+        DUNGEON_TIMEOUT = 0,          -- seconds: a dungeon running longer than this is left (0 = never)
+        DUNGEON_COOLDOWN = 30,        -- seconds between the end of a dungeon and the next one (Tower / Boss get their turn in between)
+        DUNGEON_GONE_AFTER = 20,      -- seconds without the dungeon's Exit button / dungeon events: we consider the dungeon was left (manually)
+        DUNGEON_NEAR_NPC = 150,       -- studs: being this close to the DungeonNPC while a dungeon is "running" also means it was left
     }
 
     local FONT = Enum.Font.SourceSansBold
@@ -131,6 +172,7 @@ local function runHub()
         stage = 1,         -- group of 5 floors (stage 1 = floors 1-5)
         auto = false,
         startAuto = nil,   -- set by the Tower feature (used to restore the saved switch)
+        resume = nil,      -- set by the Tower feature (relaunches the stage after a raid)
     }
     local Boss = {
         auto = false,
@@ -148,6 +190,7 @@ local function runHub()
         selected = {boss_rimuru = true}, -- selected NPC ids
         diffs = {},        -- selected difficulties (none = normal)
         setAuto = nil,     -- set by the Boss feature (used to restore the saved switch)
+        resume = nil,      -- set by the Boss feature (restarts the queue after a raid)
     }
     local Infinite = {
         on = false,        -- "Pop" switch
@@ -156,6 +199,28 @@ local function runHub()
         lastGiveUp = 0,
         weathers = {},     -- selected weathers, lowercase name -> true (empty = any)
         setPop = nil,      -- set by the Infinite feature (used to restore the saved switch)
+    }
+    local Raid = {
+        auto = false,
+        running = false,   -- a raid is in progress: every other automation is paused
+        fightStarted = false, -- StartRaidBattle was fired and its BattleEnd is awaited
+        fightDone = false, -- the BattleEnd of the current raid fight arrived
+        startedAt = 0,     -- os.clock() when the current raid fight was fired
+        fights = 0,        -- fights finished in the current raid
+        lastSlot = nil,    -- slot number (os.time() // RAID_INTERVAL) of the last raid, one raid per slot
+        setAuto = nil,     -- set by the Raid feature (used to restore the saved switch)
+        onBattleEnd = nil, -- set by the Raid feature (used by the BattleEnd router)
+        isOpen = nil,      -- set by the Raid feature: true while a raid is waiting to be done (Auto Raid ON, window open, not done)
+    }
+    local Dungeon = {
+        auto = false,
+        active = false,    -- a dungeon is starting / running: Tower, Boss and Candy leave the player alone
+        startedAt = 0,
+        lastEnd = -1e9,    -- os.clock() of the last end (the next dungeon waits DUNGEON_COOLDOWN)
+        setAuto = nil,     -- set by the Dungeon feature (used to restore the saved switch)
+        leave = nil,       -- set by the Dungeon feature (used by Auto Raid: leaves the dungeon when the raid opens)
+        resume = nil,      -- set by the Dungeon feature (used by Auto Raid: starts the dungeon again after the raid)
+        onBattleEnd = nil, -- set by the Dungeon feature (used by the BattleEnd router)
     }
 
     -- =====================================================================
@@ -231,7 +296,10 @@ local function runHub()
                     autoCandy = Candy.auto,
                     autoTower = Tower.auto,
                     autoBoss = Boss.auto,
+                    autoRaid = Raid.auto,
+                    autoDungeon = Dungeon.auto,
                     pop = Infinite.on,
+                    raidSlot = Raid.lastSlot,
                     cooldowns = liveCooldowns(),
                 }))
             end)
@@ -257,6 +325,8 @@ local function runHub()
         if tonumber(d.minFloor) then
             Infinite.minFloor = math.max(1, math.floor(tonumber(d.minFloor)))
         end
+        -- the raid of the slot that was already done / refused is not tried again after a relaunch
+        if tonumber(d.raidSlot) then Raid.lastSlot = math.floor(tonumber(d.raidSlot)) end
         -- boss cooldowns still running (absolute times, so they stay valid after a relaunch)
         if type(d.cooldowns) == "table" then
             local now = os.time()
@@ -338,7 +408,7 @@ local function runHub()
     gui.Parent = guiParent
 
     local win = Instance.new("Frame")
-    win.Size = UDim2.fromOffset(250, 566)
+    win.Size = UDim2.fromOffset(250, 770)
     win.Position = UDim2.new(0, 30, 0.3, 0)
     win.BackgroundColor3 = Color3.fromRGB(26, 14, 38)
     win.BorderSizePixel = 0
@@ -417,7 +487,7 @@ local function runHub()
     -- Open / collapse button (square, rounded corners): the embedded icon, or a "P"
     do
         local iconId = CFG.ICON_ID
-        if iconId == "" then
+        if iconId == "" and ICON_B64 and #ICON_B64 > 100 then
             pcall(function()
                 if writefile and getcustomasset then
                     writefile("pibblehub_icon.jpg", b64decode(ICON_B64))
@@ -729,11 +799,15 @@ local function runHub()
             return nil
         end
 
-        -- Makes sure we are in the lobby. Never pulls the player out of a running Auto Tower / Auto Boss.
+        -- Makes sure we are in the lobby. Never pulls the player out of a running Auto Tower / Auto Boss / Raid.
         local function goLobby()
+            if Raid.running then
+                statusL.Text = "Status: raid running"
+                return false
+            end
             if inLobby() then return true end
-            if Tower.auto or Boss.active then
-                statusL.Text = "Status: not in lobby (tower/boss running)"
+            if Tower.auto or Boss.active or Dungeon.active then
+                statusL.Text = "Status: not in lobby (tower/boss/dungeon running)"
                 return false
             end
             if os.clock() - lastLobbyTp > 15 then
@@ -766,16 +840,33 @@ local function runHub()
 
         -- ---- collect run ----
         local function run()
-            if Candy.busy then return end
+            if Candy.busy or Raid.running then return end
             Candy.busy = true
             Candy.lastRun = os.clock()
+
+            -- candies only exist in the lobby: a running dungeon is left first (AFK OFF, Exit -> SAVE & LEAVE),
+            -- and started again once the candies are collected (Auto Dungeon ON)
+            local leftDungeon = false
+            if Dungeon.active and Dungeon.leave then
+                statusL.Text = "Status: leaving dungeon"
+                if Dungeon.afkOff then pcall(Dungeon.afkOff) end
+                Dungeon.leave({ why = "candy" })
+                leftDungeon = true
+                task.wait(1)
+            end
+            local function backToDungeon()
+                if leftDungeon and Dungeon.auto and Dungeon.resume then Dungeon.resume() end
+            end
+
             if not goLobby() then
+                backToDungeon()
                 Candy.busy = false
                 return
             end
             local hrp = getHRP()
             if not hrp then
                 statusL.Text = "Status: character not found"
+                backToDungeon()
                 Candy.busy = false
                 return
             end
@@ -830,12 +921,13 @@ local function runHub()
             for id in pairs(tried) do print("Failed:", id) end
             hrp.CFrame = back
             statusL.Text = Candy.auto and "Status: auto running" or "Status: done"
+            backToDungeon()
             Candy.busy = false
         end
 
         -- Used by Auto Boss between two fights: collect the candies right away if their timer is up
         Candy.runIfReady = function()
-            if Candy.auto and not Candy.busy and candiesReady() then run() end
+            if Candy.auto and not Candy.busy and not Raid.running and candiesReady() then run() end
         end
 
         local function setAuto(on)
@@ -857,11 +949,11 @@ local function runHub()
                     local left = math.max(0, Candy.nextT - serverNow())
                     timerL.Text = ("Respawn: %dm %02ds"):format(left // 60, left % 60)
                 end
-                -- never interrupt a boss fight: bosses first, the candies are collected right after
-                if Candy.auto and not Candy.busy and not Boss.active then
+                -- never interrupt a boss fight or a raid: they go first, the candies are collected right after
+                if Candy.auto and not Candy.busy and not Boss.active and not Raid.running then
                     if candiesReady() then
                         task.spawn(run)
-                    elseif not inLobby() and not Boss.auto and not Tower.auto then
+                    elseif not inLobby() and not Boss.auto and not Tower.auto and not Dungeon.auto then
                         task.spawn(run) -- Candy is ON and nothing else is running: stay in the lobby
                     end
                 end
@@ -924,7 +1016,8 @@ local function runHub()
 
         local function relaunch()
             task.delay(CFG.AUTO_DELAY, function()
-                if Tower.auto and gui.Parent then enterStage(Tower.stage, true) end
+                -- during a raid / dungeon the tower is paused: Raid / Dungeon call Tower.resume when it is over
+                if Tower.auto and gui.Parent and not Raid.running and not Dungeon.active then enterStage(Tower.stage, true) end
             end)
         end
 
@@ -1011,6 +1104,11 @@ local function runHub()
             end)
         end
         Tower.startAuto = startAuto
+
+        -- called by Auto Raid once the raid is over: relaunches the current stage
+        Tower.resume = function()
+            if Tower.auto and gui.Parent then enterStage(Tower.stage, true) end
+        end
 
         -- ---- wiring ----
         minusBtn.MouseButton1Click:Connect(function() setStage(Tower.stage - 1) end)
@@ -1361,7 +1459,7 @@ local function runHub()
             return nil
         end
 
-        -- debug: prints every visible text found on the NPC, to see what the game displays there
+        -- debug: prints every visible text found on the NPC, to see what the game shows there
         local function dumpTexts(id)
             if not CFG.DEBUG_TIMER then return end
             local m = findNPC(id)
@@ -1772,7 +1870,7 @@ local function runHub()
                     if not s or s <= 0 then break end
                     s = math.ceil(s)
                     statusL.Text = ("Boss: all on timer, %d:%02d"):format(s // 60, s % 60)
-                    if not wentLobby and Candy.goLobby and os.clock() - lastTry > 20 then
+                    if not wentLobby and not Raid.running and Candy.goLobby and os.clock() - lastTry > 20 then
                         lastTry = os.clock()
                         local okL, inL = pcall(Candy.goLobby)
                         wentLobby = okL and inL == true -- not there yet: try again in 20 s
@@ -1816,7 +1914,8 @@ local function runHub()
         end
 
         local function bossFight()
-            if Boss.active or Boss.waiting or Boss.timerWait then return end
+            -- during a raid the boss queue is paused: Raid calls Boss.resume when it is over
+            if Boss.active or Boss.waiting or Boss.timerWait or Raid.running or Dungeon.active then return end
             if not Remotes.StartNPC then
                 statusL.Text = "StartNPCBattle not found"
                 return
@@ -1835,6 +1934,7 @@ local function runHub()
             Boss.waiting = true
             while Candy.busy do task.wait(0.5) end -- a candy run is in progress: let it finish first
             Boss.waiting = false
+            if Raid.running then return end -- a raid started while we were waiting
             Boss.active = true
             Boss.started = false -- BattleEnd events are ignored until StartNPCBattle is really fired
             Boss.current = pick
@@ -1921,6 +2021,11 @@ local function runHub()
         nextBoss = function()
             if Candy.runIfReady then Candy.runIfReady() end
             if Boss.auto and gui.Parent and not Boss.active then bossFight() end
+        end
+
+        -- called by Auto Raid once the raid is over: restarts the boss queue
+        Boss.resume = function()
+            if Boss.auto and gui.Parent and not Boss.active then nextBoss() end
         end
 
         startBtn.MouseButton1Click:Connect(function()
@@ -2049,7 +2154,7 @@ local function runHub()
             if not (nameL and timerL and shown(nameL) and shown(timerL)) then return nil end
             local n = clean(nameL.Text):match("^%s*%[%s*(.-)%s*%]%s*$")
             local secs = tonumber(clean(timerL.Text):match("(%d+)"))
-            if n and n ~= "" and secs and secs > 0 then return n end
+            if n and n ~= "" and secs and secs > 0 then return n, secs end
             return nil
         end
 
@@ -2087,12 +2192,12 @@ local function runHub()
             Settings.save()
         end)
 
-        -- Every second while Pop is ON: reads the weather and shows why it does (or doesn't) give up
+        -- Every second while Pop is ON (and no raid is running): reads the weather and shows why it does (or doesn't) give up
         task.spawn(function()
             while gui.Parent do
                 task.wait(1)
-                if Infinite.on then
-                    local n = scanWeather()
+                if Infinite.on and not Raid.running then
+                    local n, secs = scanWeather()
                     local why
                     if not n then
                         why = "no weather"
@@ -2102,6 +2207,9 @@ local function runHub()
                         why = "floor<min"
                     elseif os.clock() - Infinite.lastGiveUp < 8 then
                         why = "cooldown"
+                    elseif secs > CFG.POP_GIVEUP_LEFT then
+                        -- wanted weather found: keep playing until only POP_GIVEUP_LEFT seconds remain on it
+                        why = ("give up in %ds"):format(secs - CFG.POP_GIVEUP_LEFT)
                     else
                         why = "GIVE UP"
                         giveUp()
@@ -2127,12 +2235,902 @@ local function runHub()
     end
 
     -- =====================================================================
+    -- == 11b. FEATURE: AUTO RAID
+    -- =====================================================================
+    -- A raid slot starts at every xx:00 and xx:30 (real clock). The raid can be done during the first
+    -- 15 minutes of the slot (the timer shown in the UI). One raid = teleport to RaidWorld (skipped when
+    -- we are already there), stand next to the raid boss (Workspace.NPCs.Yhwach, NPCId raid_soul_king_npc),
+    -- then StartRaidBattle fired 4 times (each fight waits for its BattleEnd, or RAID_FIGHT_TIMEOUT).
+    -- While a raid runs, Candy / Tower / Boss / Pop are paused, and resumed right after.
+    do
+        label("Auto Raid", 570, ORANGE)
+        local statusL = label("Raid: idle", 590)
+        local timerL = label("Next raid: -", 610)
+        local startBtn = button("Start now", 10, 636, 105, 28, BLUE)
+        local autoBtn = button("Auto: OFF", 125, 636, 115, 28, RED)
+
+        local function slotOf() return math.floor(os.time() / CFG.RAID_INTERVAL) end
+        local function intoSlot() return os.time() % CFG.RAID_INTERVAL end
+        local function inWindow() return intoSlot() < CFG.RAID_WINDOW end
+
+        local function mmss(s)
+            s = math.max(0, math.floor(s))
+            return ("%dm %02ds"):format(s // 60, s % 60)
+        end
+
+        -- ---- what the server sends back (to know whether StartRaidBattle was accepted) ----
+        local Seen = { list = {} } -- {t = os.clock(), name = lowercase remote name, text = lowercase texts of the event}
+
+        local function collectTexts(v, out, depth)
+            if type(v) == "string" then
+                out[#out + 1] = v
+            elseif type(v) == "table" and depth < 3 then
+                for _, x in pairs(v) do collectTexts(x, out, depth + 1) end
+            end
+        end
+
+        local function isRefusal(text)
+            if text == "" then return false end
+            for _, w in ipairs(CFG.RAID_REFUSE_WORDS) do
+                if text:find(w, 1, true) then return true end
+            end
+            return false
+        end
+
+        for _, r in ipairs(R:GetDescendants()) do
+            if r:IsA("RemoteEvent") and not CFG.IGNORE_REMOTES[r.Name] then
+                r.OnClientEvent:Connect(function(...)
+                    local args, texts = table.pack(...), {}
+                    for i = 1, args.n do collectTexts(args[i], texts, 0) end
+                    local name = r.Name:lower()
+                    local text = clean(table.concat(texts, " ")):lower()
+                    local list = Seen.list
+                    list[#list + 1] = { t = os.clock(), name = name, text = text }
+                    if #list > 40 then table.remove(list, 1) end
+                    if Raid.running and CFG.DEBUG_TIMER and os.clock() - Raid.startedAt < 15 then
+                        local packed = {...}
+                        local okJ, txt = pcall(function() return HttpService:JSONEncode(packed) end)
+                        print("[PibbleHub] raid: server event", r.Name, okJ and txt or "(not serializable)")
+                    end
+                    -- fallback end of a raid fight, for when the result does not come through BattleEnd:
+                    -- a remote with "raid" in its name and an end-like word (sync / state events never count)
+                    if Raid.running and Raid.fightStarted and os.clock() - Raid.startedAt > CFG.RAID_MIN_FIGHT
+                        and name:find("raid", 1, true) and not name:find("sync", 1, true) and not name:find("state", 1, true)
+                        and not isRefusal(text) then
+                        for _, w in ipairs(CFG.RAID_END_EVENTS) do
+                            if name:find(w, 1, true) then
+                                Raid.fightStarted = false
+                                Raid.fightDone = true
+                                Raid.fights += 1
+                                Raid.lastEndAt = os.clock()
+                                print("[PibbleHub] raid: fight end detected from remote " .. r.Name)
+                                break
+                            end
+                        end
+                    end
+                end)
+            end
+        end
+
+        -- a server text that refuses the raid (cooldown / already done...) since `since`
+        local function refusedText(since)
+            for _, e in ipairs(Seen.list) do
+                if e.t >= since and isRefusal(e.text) then return e.text end
+            end
+        end
+
+        -- the fight was accepted: a battle / raid / fight event, that is not a refusal text
+        local function accepted(since)
+            for _, e in ipairs(Seen.list) do
+                if e.t >= since and not isRefusal(e.text) then
+                    for _, w in ipairs(CFG.RAID_START_EVENTS) do
+                        if e.name:find(w, 1, true) then return true end
+                    end
+                end
+            end
+            return false
+        end
+
+        -- the game's own start button of the raid (if the raid world shows one)
+        local function pressRaidButton()
+            local b = findButton(function(t)
+                return t == "start" or t == "fight" or t == "begin"
+                    or t:find("start raid", 1, true) ~= nil or t:find("start battle", 1, true) ~= nil
+                    or t:find("start fight", 1, true) ~= nil
+            end)
+            if b and shown(b) and activateButton(b) then
+                print("[PibbleHub] raid: pressed button", b:GetFullName())
+                return true
+            end
+            return false
+        end
+
+        -- Teleports to the raid world and waits until the character has REALLY arrived (it moved), then lets the world settle
+        local function goToRaidWorld()
+            local hrp0 = getHRP()
+            local before = hrp0 and hrp0.Position
+            Remotes.Teleport:FireServer(CFG.RAID_WORLD)
+            local t0, moved = os.clock(), false
+            while os.clock() - t0 < CFG.RAID_TP_TIMEOUT do
+                task.wait(0.25)
+                local hrp = getHRP()
+                if hrp and (not before or (hrp.Position - before).Magnitude > 100) then
+                    moved = true
+                    break
+                end
+            end
+            if CFG.DEBUG_TIMER then
+                print("[PibbleHub] raid: teleport " .. (moved and "done" or "not detected (continuing anyway)")
+                    .. " after " .. ("%.1f"):format(os.clock() - t0) .. "s")
+            end
+            task.wait(CFG.RAID_LOAD_DELAY)
+        end
+
+        -- ---- standing next to the raid boss (StartRaidBattle only works when we are close to it) ----
+        local function posOf(o)
+            if o:IsA("Model") then
+                local okP, pv = pcall(function() return o:GetPivot() end)
+                return okP and pv or nil
+            elseif o:IsA("BasePart") then
+                return o.CFrame
+            elseif o:IsA("Attachment") then
+                return CFrame.new(o.WorldPosition)
+            end
+        end
+
+        -- The raid boss is the NPC Workspace.NPCs.Yhwach (attribute NPCId = raid_soul_king_npc, prompt "Talk").
+        -- It is found by its NPCId first, then by model name, then by the billboard text ("Soul King").
+        -- Portals ("Soul King Raid") are never matched. The closest match wins.
+        local raidBossCache, raidLastScan = nil, 0
+        local function normS(x) return (tostring(x):lower():gsub("[^%w]+", "")) end
+
+        local function isRaidNPC(m)
+            if not m:IsA("Model") or Players:GetPlayerFromCharacter(m) then return false end
+            if not m:FindFirstChildOfClass("Humanoid") then return false end
+            local a = m:GetAttribute("NPCId") or m:GetAttribute("NpcId") or m:GetAttribute("npcId")
+            if a then
+                local na = normS(a)
+                if na == normS(CFG.RAID_NPC_ID) or na:find("raid", 1, true) then return true end
+            end
+            local nn = normS(m.Name)
+            for _, w in ipairs(CFG.RAID_BOSS_NAMES) do
+                local nw = normS(w)
+                if nw ~= "" and nn == nw then return true end
+            end
+            return false
+        end
+
+        local function findRaidBoss()
+            if CFG.RAID_BOSS_POS then return CFrame.new(CFG.RAID_BOSS_POS), "fixed position" end
+            -- the boss found last time is reused (no scan of the whole workspace)
+            if raidBossCache and raidBossCache.Parent and raidBossCache:IsDescendantOf(workspace) then
+                local cf0 = posOf(raidBossCache)
+                if cf0 then return cf0, raidBossCache:GetFullName() end
+            end
+            raidBossCache = nil
+            if os.clock() - raidLastScan < 0.5 then return nil end -- at most two full scans per second
+            raidLastScan = os.clock()
+
+            local hrp = getHRP()
+            local best, bestD, bestObj = nil, math.huge, nil
+            local function consider(m)
+                local cf = posOf(m)
+                if not cf then return end
+                local d = hrp and (cf.Position - hrp.Position).Magnitude or 0
+                if d < bestD then best, bestD, bestObj = cf, d, m end
+            end
+
+            -- 1) Workspace.NPCs (fast)
+            local npcs = workspace:FindFirstChild("NPCs")
+            if npcs then
+                for _, m in ipairs(npcs:GetChildren()) do
+                    if isRaidNPC(m) then consider(m) end
+                end
+            end
+            -- 2) the whole workspace
+            if not bestObj then
+                for _, d in ipairs(workspace:GetDescendants()) do
+                    if d:IsA("Model") and isRaidNPC(d) then consider(d) end
+                end
+            end
+            -- 3) billboard text ("Soul King") -> the NPC model that owns it (never a portal)
+            if not bestObj then
+                for _, d in ipairs(workspace:GetDescendants()) do
+                    if d:IsA("TextLabel") then
+                        local t = normS(clean(d.Text))
+                        for _, w in ipairs(CFG.RAID_BOSS_NAMES) do
+                            if t == normS(w) then
+                                local m = d:FindFirstAncestorWhichIsA("Model")
+                                if m and m:FindFirstChildOfClass("Humanoid") and not m.Name:lower():find("portal", 1, true) then
+                                    consider(m)
+                                end
+                            end
+                        end
+                    end
+                end
+            end
+
+            if bestObj then raidBossCache = bestObj end
+            return best, bestObj and bestObj:GetFullName() or nil
+        end
+
+        -- debug: what is around the player in the raid world, to help find the boss
+        local function dumpRaidSurroundings()
+            local hrp = getHRP()
+            if not hrp then return end
+            local out = {}
+            for _, d in ipairs(workspace:GetDescendants()) do
+                if #out >= 20 then break end
+                if d:IsA("ProximityPrompt") then
+                    local cf = posOf(d.Parent)
+                    if cf and (cf.Position - hrp.Position).Magnitude < 400 then
+                        out[#out + 1] = "prompt " .. d.Parent:GetFullName() .. " [" .. tostring(d.ActionText) .. "/" .. tostring(d.ObjectText) .. "]"
+                    end
+                elseif d:IsA("Humanoid") and d.Parent and not Players:GetPlayerFromCharacter(d.Parent) then
+                    local cf = posOf(d.Parent)
+                    if cf and (cf.Position - hrp.Position).Magnitude < 400 then
+                        out[#out + 1] = "npc " .. d.Parent:GetFullName()
+                    end
+                end
+            end
+            print("[PibbleHub] raid: boss not found. Nearby (400 studs): " .. (#out > 0 and table.concat(out, " | ") or "(nothing)"))
+            print("[PibbleHub] raid: set CFG.RAID_NPC_ID / CFG.RAID_BOSS_NAMES to the boss NPC, or CFG.RAID_BOSS_POS to a position next to it.")
+        end
+
+        -- Teleports next to the raid boss (retries for tries * 0.25 s: the boss may still be streaming in)
+        local function tpToRaidBoss(tries, dump)
+            for _ = 1, tries do
+                local hrp = getHRP()
+                local cf, what = findRaidBoss()
+                if hrp and cf then
+                    if CFG.RAID_BOSS_POS then
+                        hrp.CFrame = cf
+                    else
+                        hrp.CFrame = CFrame.new(cf.Position + cf.LookVector * 5 + Vector3.new(0, 2, 0))
+                    end
+                    if CFG.DEBUG_TIMER and dump then print("[PibbleHub] raid: teleported next to " .. tostring(what)) end
+                    task.wait(0.5)
+                    return true
+                end
+                task.wait(0.25)
+            end
+            if dump then dumpRaidSurroundings() end
+            return false
+        end
+
+        -- the Fight button of the game's own RaidGui (not the one of the BattleDummyGui)
+        local function pressRaidGuiFight()
+            local pg = player:FindFirstChild("PlayerGui")
+            local rg = pg and pg:FindFirstChild("RaidGui")
+            local b = rg and rg:FindFirstChild("FightButton", true)
+            if b and activateButton(b) then
+                print("[PibbleHub] raid: pressed RaidGui fight button")
+                return true
+            end
+            return false
+        end
+
+        -- talks to the raid boss (its "Talk" prompt) to open the RaidGui
+        local function talkToRaidBoss()
+            local m = raidBossCache
+            local prompt = m and m:FindFirstChildWhichIsA("ProximityPrompt", true)
+            if not prompt then return false end
+            if typeof(fireproximityprompt) == "function" then
+                pcall(fireproximityprompt, prompt)
+            else
+                pcall(function()
+                    prompt:InputHoldBegin()
+                    task.wait((prompt.HoldDuration or 0) + 0.1)
+                    prompt:InputHoldEnd()
+                end)
+            end
+            task.wait(0.6)
+            return true
+        end
+
+        -- Fires StartRaidBattle until the server reacts. Try 1: remote only. Try 2+: talk to the boss and press
+        -- the RaidGui Fight button too. Try 3: also any generic start button.
+        -- Returns true when the server accepted the fight.
+        local function launchFight()
+            for attempt = 1, CFG.RAID_START_TRIES do
+                tpToRaidBoss(8, attempt == 1) -- stay next to the boss (it may have moved / we may have respawned)
+                local t = os.clock()
+                Raid.startedAt = t
+                if attempt >= 2 then
+                    talkToRaidBoss()
+                    pressRaidGuiFight()
+                end
+                Remotes.StartRaid:FireServer()
+                if attempt >= 3 then pressRaidButton() end
+                while os.clock() - t < CFG.RAID_START_CHECK do
+                    if Raid.fightDone then return true end
+                    local why = refusedText(t)
+                    if why then
+                        print("[PibbleHub] raid: refused by the server: " .. why)
+                        return false, "refused"
+                    end
+                    if accepted(t) then return true end
+                    task.wait(0.2)
+                end
+                print(("[PibbleHub] raid: no server reaction (try %d/%d)"):format(attempt, CFG.RAID_START_TRIES))
+            end
+            return false, "silent"
+        end
+
+        -- manual = true: "Start now" button, ignores the 15 min window and the Auto switch
+        local function run(manual)
+            if Raid.running then return end
+            if not (Remotes.StartRaid and Remotes.Teleport) then
+                statusL.Text = "Raid: remote not found"
+                return
+            end
+            Raid.running = true -- from now on every other automation is paused
+            -- (Raid.lastSlot is only set once a fight really started: a failed attempt is retried by Auto)
+            Raid.fights = 0
+            Raid.fightStarted = false
+            Raid.fightDone = false
+
+            -- a running dungeon is left first (the raid teleport below takes us out of it anyway)
+            if Dungeon.afkOff then pcall(Dungeon.afkOff) end
+            if Dungeon.leave then Dungeon.leave({ noTeleport = true, why = "raid" }) end
+
+            -- let a running boss fight / candy run finish first (they are not started again meanwhile)
+            local t0 = os.clock()
+            while (Boss.active or Candy.busy) and os.clock() - t0 < CFG.RAID_WAIT_OTHERS do
+                statusL.Text = "Raid: waiting for current action"
+                task.wait(0.5)
+            end
+
+            -- already in the raid world (the boss is close)? then no teleport
+            local cf0 = findRaidBoss()
+            local hrpN = getHRP()
+            if cf0 and hrpN and (cf0.Position - hrpN.Position).Magnitude < CFG.RAID_NEAR then
+                statusL.Text = "Raid: already in raid world"
+            else
+                statusL.Text = "Raid: teleporting"
+                goToRaidWorld()
+            end
+            statusL.Text = "Raid: going to boss"
+            local bossFound = tpToRaidBoss(40, true)
+            if not bossFound then statusL.Text = "Raid: boss not found (see F9)" end
+
+            for i = 1, CFG.RAID_FIGHTS do
+                if not manual and (not Raid.auto or not inWindow()) then break end
+                Raid.fightDone = false
+                Raid.fightStarted = true
+                statusL.Text = ("Raid: starting fight %d/%d"):format(i, CFG.RAID_FIGHTS)
+                local okFight, why = launchFight()
+                if not okFight then
+                    Raid.fightStarted = false
+                    if why == "refused" or (CFG.RAID_SILENT_IS_COOLDOWN and bossFound) then
+                        -- the raid is on cooldown / already done: skip this slot (also saved, so a relaunch does not retry)
+                        Raid.lastSlot = slotOf()
+                        Settings.save()
+                        statusL.Text = "Raid: on cooldown, skipped until next slot"
+                        print("[PibbleHub] raid: " .. (why == "refused" and "refused by the server" or "no reaction from the server")
+                            .. " -> slot skipped. Look at the 'raid: server event' lines above if this is wrong.")
+                    else
+                        statusL.Text = ("Raid: fight %d not accepted (see F9)"):format(i)
+                        print("[PibbleHub] raid: the server never reacted to StartRaidBattle (boss not found?). Check the 'server event' lines above:"
+                            .. " if the game does answer, add a word of that remote's name to CFG.RAID_START_EVENTS.")
+                    end
+                    break
+                end
+                statusL.Text = ("Raid: fight %d/%d"):format(i, CFG.RAID_FIGHTS)
+                if Raid.lastSlot ~= slotOf() then
+                    Raid.lastSlot = slotOf() -- the raid really started: only one raid per slot (saved)
+                    Settings.save()
+                end
+
+                -- wait for the end of the fight (BattleEnd), or the timeout, or the end of the window
+                local t = os.clock()
+                while not Raid.fightDone and os.clock() - t < CFG.RAID_FIGHT_TIMEOUT do
+                    if not manual and (not Raid.auto or not inWindow()) then break end
+                    task.wait(0.25)
+                end
+                Raid.fightStarted = false
+                task.wait(CFG.RAID_FIGHT_DELAY)
+            end
+
+            Raid.fightStarted = false
+            Raid.running = false
+            if not statusL.Text:find("not accepted", 1, true) and not statusL.Text:find("cooldown", 1, true) then
+                statusL.Text = ("Raid: done (%d/%d fights)"):format(Raid.fights, CFG.RAID_FIGHTS)
+            end
+
+            -- resume what was paused: tower and boss queue restart by themselves,
+            -- otherwise (only candy / nothing) go back to the lobby
+            task.spawn(function()
+                task.wait(1)
+                if Tower.auto and Tower.resume then Tower.resume() end
+                if Boss.auto and Boss.resume then
+                    Boss.resume()
+                elseif not Tower.auto and not Dungeon.auto and Candy.goLobby then
+                    pcall(Candy.goLobby)
+                end
+                -- the dungeon starts again right after the raid
+                if Dungeon.auto and Dungeon.resume then Dungeon.resume() end
+            end)
+        end
+
+        local function setAuto(on)
+            Raid.auto = on
+            autoBtn.Text = on and "Auto: ON" or "Auto: OFF"
+            autoBtn.BackgroundColor3 = on and GREEN or RED
+            Settings.save()
+        end
+        Raid.setAuto = setAuto
+        -- a raid is "open" while Auto Raid is ON, the window is open and the raid of this slot is not done yet
+        Raid.isOpen = function()
+            return Raid.auto and inWindow() and Raid.lastSlot ~= slotOf()
+        end
+
+        startBtn.MouseButton1Click:Connect(function() task.spawn(run, true) end)
+        autoBtn.MouseButton1Click:Connect(function() setAuto(not Raid.auto) end)
+
+        -- called by the BattleEnd router, BEFORE the other handlers: returns true when the result is a raid fight
+        Raid.onBattleEnd = function(data)
+            -- duplicate of a fight end we just handled (e.g. through the remote fallback): swallow it
+            if Raid.running and not Raid.fightStarted and os.clock() - (Raid.lastEndAt or 0) < 5 then return true end
+            if not (Raid.running and Raid.fightStarted) then return false end
+            -- a dungeon result is never a raid fight
+            if (tostring(data.mode or "") .. " " .. tostring(data.tower or "")):lower():find("dungeon", 1, true) then return false end
+            -- a result of the Halloween Tower is never a raid fight
+            if data.tower == "halloween" and data.mode == "infinite_room" then return false end
+            -- results of the Infinite Tower (mode "tower") are never raid fights either
+            if data.mode == "tower" then return false end
+            if os.clock() - Raid.startedAt < CFG.RAID_MIN_FIGHT then
+                logEnd("raid (ignored, stale)", data)
+                return true
+            end
+            Raid.fightStarted = false
+            Raid.fightDone = true
+            Raid.fights += 1
+            Raid.lastEndAt = os.clock()
+            logEnd("raid", data)
+            return true
+        end
+
+        -- every second: timer + start of the raid at the beginning of each slot
+        -- (if the raid could not start, Auto tries again every RAID_RETRY_EVERY seconds during the window)
+        local lastTry = -1e9
+        task.spawn(function()
+            while gui.Parent do
+                task.wait(1)
+                if inWindow() then
+                    timerL.Text = "Raid window: " .. mmss(CFG.RAID_WINDOW - intoSlot()) .. " left"
+                    if Raid.auto and not Raid.running and Raid.lastSlot ~= slotOf()
+                        and os.clock() - lastTry > CFG.RAID_RETRY_EVERY then
+                        lastTry = os.clock()
+                        task.spawn(run, false)
+                    end
+                else
+                    timerL.Text = "Next raid in: " .. mmss(CFG.RAID_INTERVAL - intoSlot())
+                end
+            end
+        end)
+    end
+
+    -- =====================================================================
+    -- == 11c. FEATURE: AUTO DUNGEON
+    -- =====================================================================
+    -- Enters the dungeon by talking to Workspace.NPCs.DungeonNPC ("Marine Dungeon") and pressing "CONTINUE LAST RUN"
+    -- (a remote named *dungeon* + start/enter/join is tried first if one exists). It is left with Exit -> SAVE & LEAVE.
+    -- While a dungeon is running, Tower and Boss are paused.
+    --  * when the raid opens (Auto Raid ON, window open, raid not done yet) the dungeon is LEFT and not restarted
+    --  * once the raid is over the dungeon starts again by itself
+    -- The remotes of the game are not known: every server event of a *dungeon* remote is printed in F9
+    -- ("dungeon: server event ...") so the CFG.DUNGEON_* settings can be adjusted if the auto-detection is wrong.
+    do
+        label("Auto Dungeon", 676, ORANGE)
+        local statusL = label("Dungeon: idle", 696)
+        local startBtn = button("Start now", 10, 722, 105, 28, BLUE)
+        local autoBtn = button("Auto: OFF", 125, 722, 115, 28, RED)
+
+        -- ---- server events of the dungeon remotes ----
+        local Seen = { list = {} } -- {t = os.clock(), name = lowercase remote name, text = lowercase json}
+        local lastSeenExit = 0   -- os.clock() of the last sign that we are inside the dungeon (Exit button, dungeon event / fight)
+        local leaving = false    -- the leave sequence is running (AFK must stay OFF)
+
+        local function textOfBtn(b)
+            if b:IsA("TextButton") then return clean(b.Text):lower() end
+            for _, c in ipairs(b:GetDescendants()) do
+                if c:IsA("TextLabel") and clean(c.Text):match("%S") then return clean(c.Text):lower() end
+            end
+            return ""
+        end
+
+        -- the AFK toggle of the dungeon ("AFK: ON" / "AFK: OFF"): returns the button and whether it is ON
+        local function afkButton()
+            local b = findButton(function(t) return t:find("^%s*afk%s*:") ~= nil end)
+            if b and shown(b) then
+                local t = textOfBtn(b)
+                return b, (t:find("off", 1, true) == nil and t:find("on", 1, true) ~= nil)
+            end
+        end
+
+        -- puts the AFK toggle in the wanted state (the dungeon cannot be left while AFK is ON)
+        local function setAfk(want)
+            for _ = 1, 3 do
+                local b, on = afkButton()
+                if not b then return false end
+                if on == want then return true end
+                activateButton(b)
+                task.wait(0.5)
+            end
+            local b, on = afkButton()
+            return b ~= nil and on == want
+        end
+
+        local function finish(why)
+            if not Dungeon.active then return end
+            Dungeon.active = false
+            leaving = false
+            Dungeon.lastEnd = os.clock()
+            statusL.Text = "Dungeon: " .. why
+            -- give the paused features their turn back (during a raid, the raid resumes everything itself)
+            task.spawn(function()
+                task.wait(1.5)
+                if Raid.running or Dungeon.active then return end
+                if Tower.auto and Tower.resume then Tower.resume() end
+                if Boss.auto and Boss.resume then Boss.resume() end
+            end)
+        end
+
+        local dungeonRemotes = {}
+        for _, r in ipairs(R:GetDescendants()) do
+            if r:IsA("RemoteEvent") and r.Name:lower():find("dungeon", 1, true) then
+                dungeonRemotes[#dungeonRemotes + 1] = r.Name
+                r.OnClientEvent:Connect(function(...)
+                    local args = {...}
+                    local okJ, txt = pcall(function() return HttpService:JSONEncode(args) end)
+                    txt = (okJ and txt or "(not serializable)"):lower()
+                    local name = r.Name:lower()
+                    local list = Seen.list
+                    list[#list + 1] = { t = os.clock(), name = name, text = txt }
+                    if #list > 40 then table.remove(list, 1) end
+                    if CFG.DEBUG_TIMER then print("[PibbleHub] dungeon: server event", r.Name, txt:sub(1, 300)) end
+                    -- server events only prove we are still inside: they NEVER end the dungeon.
+                    -- The only ways out are: manual leave (detected below), the raid, or the Stop of Auto.
+                    if Dungeon.active then lastSeenExit = os.clock() end
+                end)
+            end
+        end
+        print("[PibbleHub] dungeon remotes found: " .. (#dungeonRemotes > 0 and table.concat(dungeonRemotes, ", ") or "(none)"))
+
+        -- a remote called *dungeon* whose name contains one of the words (or the exact name from the CFG)
+        local function pickRemote(exact, words)
+            if exact ~= "" then
+                local r = R:FindFirstChild(exact, true)
+                if r then return r end
+            end
+            for _, r in ipairs(R:GetDescendants()) do
+                if r:IsA("RemoteEvent") then
+                    local n = r.Name:lower()
+                    if n:find("dungeon", 1, true) then
+                        for _, w in ipairs(words) do
+                            if n:find(w, 1, true) then return r end
+                        end
+                    end
+                end
+            end
+        end
+
+        local function pivotOf(o)
+            if o:IsA("Model") then
+                local okP, pv = pcall(function() return o:GetPivot() end)
+                return okP and pv or nil
+            elseif o:IsA("BasePart") then
+                return o.CFrame
+            end
+        end
+
+        -- ---- the dungeon NPC (Workspace.NPCs.DungeonNPC) ----
+        local function dungeonNPC()
+            local npcs = workspace:FindFirstChild("NPCs")
+            local m = npcs and npcs:FindFirstChild(CFG.DUNGEON_NPC)
+            if m then return m end
+            for _, p in ipairs(workspace:GetDescendants()) do
+                if p:IsA("ProximityPrompt") and tostring(p.ObjectText):lower():find("dungeon", 1, true) then
+                    return p:FindFirstAncestorWhichIsA("Model") or p.Parent
+                end
+            end
+        end
+
+        -- teleports next to the NPC (goes to the lobby first when the NPC is not loaded)
+        local function goToNPC()
+            local askedLobby = false
+            for i = 1, 60 do
+                if Raid.running then return nil end
+                local npc = dungeonNPC()
+                local hrp = getHRP()
+                local cf = npc and pivotOf(npc)
+                if npc and hrp and cf then
+                    hrp.CFrame = CFrame.new(cf.Position + cf.LookVector * 5 + Vector3.new(0, 2, 0))
+                    task.wait(0.5)
+                    return npc
+                end
+                if not npc and not askedLobby and i >= 4 and Remotes.Teleport then
+                    askedLobby = true
+                    statusL.Text = "Dungeon: going to lobby"
+                    Remotes.Teleport:FireServer("lobby")
+                end
+                task.wait(0.25)
+            end
+            return nil
+        end
+
+        -- did the server react (a dungeon event) or did the character move (teleported inside)?
+        local function waitAccepted(since, before)
+            local t0 = os.clock()
+            while os.clock() - t0 < CFG.DUNGEON_START_CHECK do
+                if Raid.running then return false end
+                for _, e in ipairs(Seen.list) do
+                    if e.t >= since then return true end
+                end
+                local hrp = getHRP()
+                if hrp and before and (hrp.Position - before).Magnitude > 100 then return true end
+                task.wait(0.25)
+            end
+            return false
+        end
+
+        local function startViaRemote()
+            local r = pickRemote(CFG.DUNGEON_START_REMOTE, {"start", "enter", "join", "begin", "queue"})
+            if not r then return false end
+            local hrp0 = getHRP()
+            local since = os.clock()
+            print("[PibbleHub] dungeon: firing remote " .. r.Name)
+            r:FireServer(table.unpack(CFG.DUNGEON_ARGS))
+            return waitAccepted(since, hrp0 and hrp0.Position)
+        end
+
+        local function startViaNPC()
+            local npc = goToNPC()
+            if not npc then return false end
+            local prompt = npc:FindFirstChildWhichIsA("ProximityPrompt", true)
+            if not prompt then
+                print("[PibbleHub] dungeon: no prompt on " .. npc:GetFullName())
+                return false
+            end
+            local hrp0 = getHRP()
+            local since = os.clock()
+            if typeof(fireproximityprompt) == "function" then
+                pcall(fireproximityprompt, prompt)
+            else
+                pcall(function()
+                    prompt:InputHoldBegin()
+                    task.wait((prompt.HoldDuration or 0) + 0.1)
+                    prompt:InputHoldEnd()
+                end)
+            end
+            task.wait(0.8)
+            -- debug: what the dialog shows
+            if CFG.DEBUG_TIMER then
+                local pg = player:FindFirstChild("PlayerGui")
+                local out = {}
+                if pg then
+                    for _, b in ipairs(pg:GetDescendants()) do
+                        if #out >= 15 then break end
+                        if b:IsA("TextButton") and not b:IsDescendantOf(gui) and shown(b) and clean(b.Text):match("%S") then
+                            out[#out + 1] = clean(b.Text)
+                        end
+                    end
+                end
+                print("[PibbleHub] dungeon: buttons after talking: " .. (#out > 0 and table.concat(out, " | ") or "(none)"))
+            end
+            -- the dialog shows a blue button "CONTINUE LAST RUN - STAGE 34 (3 LIVES)" (stage / lives change): wait for it, press it
+            local b
+            local t1 = os.clock()
+            while os.clock() - t1 < 4 and not b do
+                b = findButton(function(t) return t:find("continue last run", 1, true) ~= nil end)
+                if b and not shown(b) then b = nil end
+                if not b then task.wait(0.25) end
+            end
+            if not b then -- fallback: a "new run" / start button
+                b = findButton(function(t)
+                    return t:find("new run", 1, true) ~= nil or t:find("start run", 1, true) ~= nil
+                        or t:find("start dungeon", 1, true) ~= nil or t:find("enter dungeon", 1, true) ~= nil
+                end)
+                if b and not shown(b) then b = nil end
+            end
+            if b then
+                print("[PibbleHub] dungeon: pressed " .. btnText(b) .. " (" .. b:GetFullName() .. ")")
+                activateButton(b)
+            else
+                print("[PibbleHub] dungeon: no start button found after talking to the NPC")
+            end
+            return waitAccepted(since, hrp0 and hrp0.Position)
+        end
+
+        local function startDungeon()
+            for round = 1, CFG.DUNGEON_START_TRIES do
+                if Raid.running then return false end
+                statusL.Text = ("Dungeon: starting (%d/%d)"):format(round, CFG.DUNGEON_START_TRIES)
+                if startViaRemote() then return true end
+                if Raid.running then return false end
+                if startViaNPC() then return true end
+            end
+            return false
+        end
+
+        -- ---- leaving ----
+        -- opts.noTeleport = true: the caller teleports somewhere else right after (the raid does)
+        local function leave(opts)
+            opts = opts or {}
+            if not Dungeon.active then return end
+            statusL.Text = "Dungeon: leaving"
+            leaving = true
+            local done = false
+            -- 0) the dungeon cannot be left while AFK is ON: turn it OFF first
+            if setAfk(false) then
+                print("[PibbleHub] dungeon: AFK turned OFF")
+            else
+                print("[PibbleHub] dungeon: AFK button not found / still ON (continuing anyway)")
+            end
+            -- 1) the game's own way: the "Exit" button (X), then "SAVE & LEAVE"
+            local ex = findButton(function(t) return t == "exit" end)
+            if ex and shown(ex) and activateButton(ex) then
+                print("[PibbleHub] dungeon: pressed Exit " .. ex:GetFullName())
+                local sl
+                local t1 = os.clock()
+                while os.clock() - t1 < 3 and not sl do
+                    task.wait(0.25)
+                    sl = findButton(function(t) return t:find("save", 1, true) ~= nil and t:find("leave", 1, true) ~= nil end)
+                    if sl and not shown(sl) then sl = nil end
+                end
+                if sl and activateButton(sl) then
+                    print("[PibbleHub] dungeon: pressed Save & Leave " .. sl:GetFullName())
+                    done = true
+                    task.wait(0.8)
+                else
+                    print("[PibbleHub] dungeon: Save & Leave button not found after Exit")
+                end
+            else
+                print("[PibbleHub] dungeon: Exit button not found")
+            end
+            -- 2) fallbacks: a leave remote, then the lobby teleport
+            if not done then
+                local r = pickRemote(CFG.DUNGEON_LEAVE_REMOTE, {"leave", "exit", "quit", "abandon", "forfeit", "giveup"})
+                if r then
+                    print("[PibbleHub] dungeon: firing remote " .. r.Name)
+                    r:FireServer(table.unpack(CFG.DUNGEON_LEAVE_ARGS))
+                    task.wait(0.5)
+                end
+                if not opts.noTeleport and Remotes.Teleport then
+                    Remotes.Teleport:FireServer("lobby")
+                end
+            end
+            finish(opts.why and ("left (" .. opts.why .. ")") or "left")
+        end
+        Dungeon.leave = leave
+        -- used by Auto Raid: AFK OFF whatever the state of the script (the raid teleport / Exit need it OFF)
+        Dungeon.afkOff = function() return setAfk(false) end
+
+        -- ---- one dungeon run ----
+        local function runOnce()
+            if Dungeon.active or Raid.running then return end
+            Dungeon.active = true -- from now on Tower / Boss / Candy leave the player alone
+            Dungeon.startedAt = os.clock()
+            while Candy.busy and not Raid.running do task.wait(0.5) end
+            if Raid.running then
+                Dungeon.active = false
+                return
+            end
+            if startDungeon() then
+                Dungeon.startedAt = os.clock()
+                lastSeenExit = os.clock()
+                leaving = false
+                statusL.Text = "Dungeon: running"
+                -- once inside, turn AFK ON (the button shows up after the teleport / loading)
+                task.spawn(function()
+                    for _ = 1, 15 do
+                        if not Dungeon.active or leaving then return end
+                        local b, on = afkButton()
+                        if b then
+                            if not on then
+                                setAfk(true)
+                                print("[PibbleHub] dungeon: AFK turned ON")
+                            end
+                            return
+                        end
+                        task.wait(1)
+                    end
+                end)
+            else
+                Dungeon.active = false
+                Dungeon.lastEnd = os.clock()
+                if not Raid.running then
+                    statusL.Text = "Dungeon: could not start (see F9)"
+                    print("[PibbleHub] dungeon: could not start. Look at the 'dungeon: server event' / 'buttons after talking' lines,"
+                        .. " then set CFG.DUNGEON_START_REMOTE / CFG.DUNGEON_ARGS.")
+                    if Tower.auto and Tower.resume then Tower.resume() end
+                    if Boss.auto and Boss.resume then Boss.resume() end
+                end
+            end
+        end
+
+        -- called by Auto Raid once the raid is over
+        Dungeon.resume = function()
+            Dungeon.lastEnd = -1e9 -- no cooldown: start again right away
+        end
+
+        local function setAuto(on)
+            Dungeon.auto = on
+            autoBtn.Text = on and "Auto: ON" or "Auto: OFF"
+            autoBtn.BackgroundColor3 = on and GREEN or RED
+            Settings.save()
+        end
+        Dungeon.setAuto = setAuto
+
+        startBtn.MouseButton1Click:Connect(function() task.spawn(runOnce) end)
+        autoBtn.MouseButton1Click:Connect(function()
+            setAuto(not Dungeon.auto)
+            -- turning Auto ON starts the dungeon right away, without any check (cooldown, boss / candy, raid window).
+            -- Only a raid in progress or a dungeon already running prevents it (runOnce checks that itself).
+            if Dungeon.auto then
+                Dungeon.lastEnd = -1e9
+                task.spawn(runOnce)
+            end
+        end)
+
+        -- called by the BattleEnd router: returns true for the results of a dungeon fight
+        Dungeon.onBattleEnd = function(data)
+            local m = (tostring(data.mode or "") .. " " .. tostring(data.tower or "")):lower()
+            if not m:find("dungeon", 1, true) then return false end
+            logEnd("dungeon", data)
+            -- a dungeon fight result never ends the run (the dungeon goes on stage after stage)
+            if Dungeon.active then lastSeenExit = os.clock() end
+            return true
+        end
+
+        -- every 2 s: timeout of a running dungeon + automatic start
+        task.spawn(function()
+            while gui.Parent do
+                task.wait(2)
+                if Dungeon.active then
+                    if CFG.DUNGEON_TIMEOUT > 0 and not Raid.running and os.clock() - Dungeon.startedAt > CFG.DUNGEON_TIMEOUT then
+                        leave({ why = "timeout" })
+                    elseif not leaving and not Raid.running and os.clock() - Dungeon.startedAt > 15 then
+                        -- did we leave the dungeon by hand? (no Exit button for a while, or back next to the dungeon NPC)
+                        local ex = findButton(function(t) return t == "exit" end)
+                        if ex and shown(ex) then lastSeenExit = os.clock() end
+                        local npc = dungeonNPC()
+                        local hrp, cf = getHRP(), nil
+                        if npc then cf = pivotOf(npc) end
+                        local nearNpc = hrp and cf and (cf.Position - hrp.Position).Magnitude < CFG.DUNGEON_NEAR_NPC
+                        if nearNpc or os.clock() - lastSeenExit > CFG.DUNGEON_GONE_AFTER then
+                            print("[PibbleHub] dungeon: left manually (" .. (nearNpc and "next to the NPC" or "no Exit button") .. ")")
+                            finish("left manually")
+                        else
+                            -- still inside: keep AFK ON
+                            local b, on = afkButton()
+                            if b and not on then setAfk(true) end
+                        end
+                    end
+                elseif Dungeon.auto and not Raid.running then
+                    local raidOpen = Raid.isOpen and Raid.isOpen()
+                    if raidOpen then
+                        statusL.Text = "Dungeon: waiting (raid open)"
+                    elseif Boss.active or (Boss.auto and not Boss.timerWait) or Candy.busy then
+                        statusL.Text = "Dungeon: waiting (boss/candy)"
+                    elseif os.clock() - Dungeon.lastEnd >= CFG.DUNGEON_COOLDOWN then
+                        task.spawn(runOnce)
+                    end
+                end
+            end
+        end)
+    end
+
+    -- =====================================================================
     -- == 12. BATTLEEND ROUTER + RESTORE OF THE SAVED SWITCHES
     -- =====================================================================
-    -- 1) a boss fight started by Auto Boss  2) the Infinite Tower  3) the Halloween Tower
+    -- 1) a raid fight  2) a boss fight started by Auto Boss  3) a dungeon fight  4) the Infinite Tower  5) the Halloween Tower
     Remotes.BattleEnd.OnClientEvent:Connect(function(data)
         if type(data) ~= "table" then return end
+        if Raid.onBattleEnd(data) then return end
         if Boss.onBattleEnd(data) then return end
+        if Dungeon.onBattleEnd(data) then return end
         if Infinite.onBattleEnd(data) then return end
         Tower.onBattleEnd(data)
     end)
@@ -2146,9 +3144,12 @@ local function runHub()
         if d.autoCandy == true and not Candy.auto then Candy.setAuto(true) end
         if d.autoTower == true and not Tower.auto then Tower.startAuto() end
         if d.autoBoss == true and not Boss.auto then Boss.setAuto(true) end
+        if d.autoRaid == true and not Raid.auto then Raid.setAuto(true) end
+        if d.autoDungeon == true and not Dungeon.auto then Dungeon.setAuto(true) end
         if d.pop == true and not Infinite.on then Infinite.setPop(true) end
         Settings.armed = true
         Settings.save()
+        print("[PibbleHub] loaded")
     end)
 end
 
@@ -2156,8 +3157,9 @@ end
 -- == 13. START-UP + EMBEDDED ICON
 -- =========================================================================
 -- Puppy icon (base64 JPEG). It is written to a local file and loaded with getcustomasset.
-ICON_B64 = [[
-/9j/4AAQSkZJRgABAQAAAQABAAD/2wCEAAkGBwgICggICAgICAgICRYGCQkJCRsICQYWIB0iIiAdHx8kKC0sJCYxJx8fLT8tMTUw
+-- Optional. To change the icon, replace ONLY the base64 text (the long line starting with /9j/) between the
+-- two double brackets below. Left empty, the toggle button simply shows a "P" instead of the icon.
+ICON_B64 = [[/9j/4AAQSkZJRgABAQAAAQABAAD/2wCEAAkGBwgICggICAgICAgICRYGCQkJCRsICQYWIB0iIiAdHx8kKC0sJCYxJx8fLT8tMTUw
 Mz0zIyszRj8sNy0tLisBCgoKDQ0NDg0NDysZFRkrKystKysrKysrKysrLSsrKysrKysrKysrKysrKysrKysrKysrKy0rKy0tKysr
 KysrK//AABEIAPAA8AMBIgACEQEDEQH/xAAcAAACAgMBAQAAAAAAAAAAAAADBAIFAQYHAAj/xABBEAACAQMCBAMFBgQEBgEFAAAB
 AgMAERIEIRMiMUEFUWEGMnGBkRQjQlKhsQdiwdEzQ3KCFVNj4fDxgxckVJKi/8QAGAEBAQEBAQAAAAAAAAAAAAAAAAECAwT/xAAg
