@@ -1,66 +1,73 @@
-local ok, err = xpcall(function()
+--[[
+    PibbleHub
+    =====================================================================
+    Layout of this file (search for the "== N." headers):
+       1. Services & remotes
+       2. Config & static data
+       3. Shared state (one table per feature)
+       4. Settings (saved to a file, restored on the next launch)
+       5. Generic helpers
+       6. Window & UI builders
+       7. GUI automation helpers (find / press the game's buttons)
+      7b. Anti-AFK
+      7c. World teleport (Auto Boss: each boss NPC lives in its own world)
+       8. Feature: Candy Collector
+       9. Feature: Halloween Tower
+      10. Feature: Auto Boss
+      11. Feature: Infinite Tower (auto give up when a weather appears)
+      12. BattleEnd router + restore of the saved switches
+      13. Start-up + embedded icon (at the very bottom of the file)
+
+    Every feature lives in its own do ... end block: its UI, its logic and its
+    event wiring are all in one place. Features talk to each other only through
+    the state tables from section 3 (Candy, Tower, Boss, Infinite).
+]]
+
+local ICON_B64 -- base64 JPEG of the toggle-button icon, assigned at the bottom of the file
+
+local function runHub()
+    -- =====================================================================
+    -- == 1. SERVICES & REMOTES
+    -- =====================================================================
     local Players = game:GetService("Players")
     local CS = game:GetService("CollectionService")
+    local HttpService = game:GetService("HttpService")
     local R = game:GetService("ReplicatedStorage"):WaitForChild("Remotes")
-    local CandyState = R:WaitForChild("CandyState")
-    local Request = R:WaitForChild("RequestCandyState")
-    local StartBattle = R:WaitForChild("StartBattle")
-    local BattleEnd = R:WaitForChild("BattleEnd")
-    local OpenTower = R:WaitForChild("OpenHalloweenTower")
-    local EndTower = R:WaitForChild("EndTowerRemote", 5) -- "Give up"
+
+    local Remotes = {
+        CandyState = R:WaitForChild("CandyState"),
+        RequestCandy = R:WaitForChild("RequestCandyState"),
+        StartBattle = R:WaitForChild("StartBattle"),
+        BattleEnd = R:WaitForChild("BattleEnd"),
+        OpenTower = R:WaitForChild("OpenHalloweenTower"),
+        EndTower = R:WaitForChild("EndTowerRemote", 5),     -- "Give up"
+        Teleport = R:WaitForChild("TeleportToWorld", 5),    -- :FireServer("lobby")
+        SetNPCDiff = R:WaitForChild("SetNPCDifficulty", 5), -- :FireServer("hw_alucard_anderson", "impossible")
+        StartNPC = R:WaitForChild("StartNPCBattle", 5),     -- :FireServer("boss_rimuru")
+    }
     local player = Players.LocalPlayer
 
-    local SLOT = 2          -- updated automatically when the tower UI opens
-    local MAX_FLOOR = 500
-    local MAX_STAGE = 100   -- 100 groups of 5 floors
-    local AUTO_DELAY = 3    -- seconds between two milestones / retries
-    local END_ARG = 1       -- argument sent to EndTowerRemote (as logged when clicking Give up)
-
-    local state, offset, auto, busy, total, nextT = {}, 0, false, false, 0, nil
-    local stage, towerAuto = 1, false
-    local restoreTowerGui   -- defined below, shows the tower UI again after auto stops
-    local popOn, minPopFloor = false, 1            -- Infinite Tower: auto give up when a weather appears
-    local infFloor = 1                             -- current floor of the Infinite Tower run
-    local weatherName, lastGiveUp = nil, 0
-    -- List of weathers (shown in the Weather menu)
-    local WEATHERS = {"Typhoon", "Blizzard", "Windstorm", "Sharingan", "Singularity", "Lightning",
-                      "Monarch Domain", "Void", "Made in Heaven"}
-    -- Selected weathers (lowercase name -> true). Empty = any weather triggers the give up.
-    local selected = {}
-
-    local function weatherAllowed(name)
-        if next(selected) == nil then return true end
-        return selected[tostring(name or ""):lower()] == true
-    end
-
-    CandyState.OnClientEvent:Connect(function(t, now)
-        if type(now) == "number" then offset = now - os.time() end
-        state = type(t) == "table" and t or {}
-    end)
-
-    -- ========== UI ==========
-    local parent = (gethui and gethui()) or game:GetService("CoreGui")
-    for _, n in ipairs({"PibbleHub", "HalloweenUI"}) do
-        local old = parent:FindFirstChild(n)
-        if old then old:Destroy() end
-    end
-
-    local gui = Instance.new("ScreenGui")
-    gui.Name = "PibbleHub"
-    gui.ResetOnSpawn = false
-    gui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
-    gui.Parent = parent
-
-    local main = Instance.new("Frame")
-    main.Size = UDim2.fromOffset(250, 414)
-    main.Position = UDim2.new(0, 30, 0.3, 0)
-    main.BackgroundColor3 = Color3.fromRGB(26, 14, 38)
-    main.BorderSizePixel = 0
-    main.Active = true
-    main.Draggable = true
-    main.ZIndex = 1
-    main.Parent = gui
-    Instance.new("UICorner", main)
+    -- =====================================================================
+    -- == 2. CONFIG & STATIC DATA
+    -- =====================================================================
+    local CFG = {
+        MAX_FLOOR = 500,
+        MAX_STAGE = 100,     -- 100 groups of 5 floors
+        AUTO_DELAY = 3,      -- seconds between two milestones / retries
+        END_ARG = 1,         -- argument sent to EndTowerRemote (as logged when clicking Give up)
+        BOSS_TIMEOUT = 300,  -- seconds: if no BattleEnd arrives, the fight is considered over
+        BOSS_RETRIES = 2,    -- retries of the SAME boss + difficulty after a loss, before moving on
+        BOSS_MIN_FIGHT = 5,  -- seconds: a BattleEnd received sooner than this is a stale event of the previous fight
+        TIMER_CHECK_DELAY = 3.5, -- seconds after StartNPCBattle during which a "cooldown" answer is looked for
+        TIMER_MARGIN = 2,    -- seconds added to a detected timer before trying that boss again
+        UNKNOWN_COOLDOWN = 600, -- seconds a boss is put aside when the server refused it without telling the timer
+        REFUSE_IF_SILENT = true, -- true: if the server sends NOTHING back after StartNPCBattle, the fight is treated as refused (cooldown)
+        IGNORE_REMOTES = { CandyState = true }, -- server events that don't count as an "answer" (they fire all the time)
+        TRUST_NPC_TIMER = false, -- true: also use the timer written above the NPC (it is NOT per difficulty, so it is off). The real per-difficulty timers are read from the NPC dialog
+        DEBUG_TIMER = true,  -- print what the game shows / sends around each boss attempt (F9 console)
+        RESTORE_DELAY = 3,   -- seconds after launch before the saved switches are restored
+        ICON_ID = "",        -- optional: force an image, e.g. "rbxassetid://123456789" (empty = embedded icon)
+    }
 
     local FONT = Enum.Font.SourceSansBold
     local ORANGE = Color3.fromRGB(255, 160, 50)
@@ -68,13 +75,1909 @@ local ok, err = xpcall(function()
     local DARK = Color3.fromRGB(80, 60, 110)
     local RED = Color3.fromRGB(110, 60, 60)
     local GREEN = Color3.fromRGB(50, 140, 80)
-    local PURPLE = Color3.fromRGB(120, 60, 150)
 
-    -- ========== Open / collapse button (square, rounded corners) ==========
-    -- Icon: the embedded puppy is used by default. To force another image, paste its id here, e.g. "rbxassetid://123456789"
-    local ICON_ID = ""
-    -- Puppy icon embedded in the script (base64 JPEG). It is written to a local file and loaded with getcustomasset.
-    local ICON_B64 = [[
+    -- Weathers shown in the Infinite Tower menu
+    local WEATHERS = {"Typhoon", "Blizzard", "Windstorm", "Sharingan", "Singularity", "Lightning",
+                      "Monarch Domain", "Void", "Made in Heaven"}
+
+    -- Auto Boss difficulties
+    local DIFFS = {"normal", "medium", "hard", "extreme", "impossible"}
+
+    -- Every NPC of every world, in progression order (the last one of each world is its boss)
+    local BOSS_WORLDS = {
+        {"Namek", {"goku", "vegeta", "boss_frieza"}},
+        {"Leaf Village", {"naruto", "kakashi", "boss_pain"}},
+        {"Dressrosa", {"usopp", "sanji", "boss_doflamingo"}},
+        {"Shibuya", {"itadori", "toji", "boss_sukuna"}},
+        {"Soul Society", {"rukia", "ichigo", "boss_aizen"}},
+        {"Train to Kyoto", {"power", "denji", "boss_makima"}},
+        {"Isekai", {"ise_tanya_npc", "ise_smith_npc", "boss_rimuru"}},
+        {"Hellsing Mansion", {"hw_walter", "hw_seras_integra", "hw_alucard_anderson"}},
+    }
+    -- Reward of the first clear (grows with the difficulty), shown next to each NPC
+    local FIRST_CLEAR = {
+        boss_aizen = 800, boss_doflamingo = 60, boss_frieza = 40, boss_makima = 1000, boss_pain = 50,
+        boss_rimuru = 1200, boss_sukuna = 400, denji = 300, goku = 20, hw_alucard_anderson = 1400,
+        hw_seras_integra = 400, hw_walter = 400, ichigo = 250, ise_smith_npc = 350, ise_tanya_npc = 350,
+        itadori = 200, kakashi = 30, naruto = 30, power = 300, rukia = 250, sanji = 40, toji = 200,
+        usopp = 40, vegeta = 20,
+    }
+
+    -- Any of these battle results counts as a loss -> retry the SAME stage
+    local LOSS = { lose = true, loss = true, lost = true, defeat = true, fail = true, failed = true }
+
+    -- =====================================================================
+    -- == 3. SHARED STATE
+    -- =====================================================================
+    local Candy = {
+        state = {},        -- candyId -> respawn timestamp (server time), pushed by the server
+        offset = 0,        -- server time - local time
+        auto = false,
+        busy = false,      -- a collect run is in progress
+        total = 0,
+        nextT = nil,       -- earliest respawn timestamp
+        lastRun = 0,
+        runIfReady = nil,  -- set by the Candy feature
+        setAuto = nil,     -- set by the Candy feature (used to restore the saved switch)
+        goLobby = nil,     -- set by the Candy feature (teleports to the lobby, used by Auto Boss)
+    }
+    local Tower = {
+        slot = 2,          -- updated automatically when the tower UI opens
+        stage = 1,         -- group of 5 floors (stage 1 = floors 1-5)
+        auto = false,
+        startAuto = nil,   -- set by the Tower feature (used to restore the saved switch)
+    }
+    local Boss = {
+        auto = false,
+        active = false,    -- a fight started by this script is running
+        waiting = false,
+        run = 0,           -- id of the current fight (for the timeout)
+        current = nil,     -- {id, difficulty} of the fight in progress
+        lastDone = nil,    -- key "id|difficulty" of the last finished fight (the queue resumes right after it)
+        retries = 0,       -- losses in a row on the current fight
+        started = false,   -- true once StartNPCBattle was fired for the current fight
+        startedAt = 0,     -- os.clock() when it was fired
+        lastEnd = 0,       -- os.clock() of the last handled BattleEnd
+        cooldown = {},     -- "id|difficulty" -> os.time() when that fight is available again (saved to the file)
+        timerWait = false, -- true while waiting in the lobby for a cooldown to end
+        selected = {boss_rimuru = true}, -- selected NPC ids
+        diffs = {},        -- selected difficulties (none = normal)
+        setAuto = nil,     -- set by the Boss feature (used to restore the saved switch)
+    }
+    local Infinite = {
+        on = false,        -- "Pop" switch
+        minFloor = 1,
+        floor = 1,         -- current floor of the run
+        lastGiveUp = 0,
+        weathers = {},     -- selected weathers, lowercase name -> true (empty = any)
+        setPop = nil,      -- set by the Infinite feature (used to restore the saved switch)
+    }
+
+    -- =====================================================================
+    -- == 4. SETTINGS (saved to a file, restored on the next launch)
+    -- =====================================================================
+    -- Saved: selected bosses, difficulties, weathers, tower stage, min floor
+    -- and the state of the Auto / Pop switches (restored a few seconds after launch,
+    -- see the end of section 12).
+    local Settings = {
+        file = "PibbleHub_" .. tostring(player.UserId) .. ".json",
+        armed = false,     -- saving only starts once the UI is built and the switches are restored
+        queued = false,
+        data = {},         -- what was loaded from the file
+    }
+
+    local function keysOf(t)
+        local out = {}
+        for k, v in pairs(t) do
+            if v then out[#out + 1] = k end
+        end
+        table.sort(out)
+        return out
+    end
+
+    -- keeps only the known values of a saved list
+    local function toSet(list, valid)
+        local set = {}
+        if type(list) ~= "table" then return nil end
+        for _, v in ipairs(list) do
+            if valid[v] then set[v] = true end
+        end
+        return set
+    end
+
+    local function toValidSet(list)
+        local s = {}
+        for _, v in ipairs(list) do s[v] = true end
+        return s
+    end
+
+    function Settings.load()
+        local ok, data = pcall(function()
+            if isfile and readfile and isfile(Settings.file) then
+                return HttpService:JSONDecode(readfile(Settings.file))
+            end
+        end)
+        Settings.data = (ok and type(data) == "table") and data or {}
+    end
+
+    -- cooldowns that are still running (expired ones are not worth saving)
+    local function liveCooldowns()
+        local out, now = {}, os.time()
+        for k, v in pairs(Boss.cooldown) do
+            if type(v) == "number" and v > now then out[k] = v end
+        end
+        return out
+    end
+
+    -- debounced: several changes in a row produce a single write
+    function Settings.save()
+        if not Settings.armed or Settings.queued then return end
+        Settings.queued = true
+        task.delay(0.5, function()
+            Settings.queued = false
+            pcall(function()
+                if not writefile then return end
+                writefile(Settings.file, HttpService:JSONEncode({
+                    bosses = keysOf(Boss.selected),
+                    diffs = keysOf(Boss.diffs),
+                    weathers = keysOf(Infinite.weathers),
+                    stage = Tower.stage,
+                    minFloor = Infinite.minFloor,
+                    autoCandy = Candy.auto,
+                    autoTower = Tower.auto,
+                    autoBoss = Boss.auto,
+                    pop = Infinite.on,
+                    cooldowns = liveCooldowns(),
+                }))
+            end)
+        end)
+    end
+
+    -- apply the saved values to the state tables
+    Settings.load()
+    do
+        local d = Settings.data
+        local validBosses, validDiffs, validWeathers = {}, toValidSet(DIFFS), {}
+        for _, w in ipairs(BOSS_WORLDS) do
+            for _, id in ipairs(w[2]) do validBosses[id] = true end
+        end
+        for _, w in ipairs(WEATHERS) do validWeathers[w:lower()] = true end
+
+        Boss.selected = toSet(d.bosses, validBosses) or Boss.selected
+        Boss.diffs = toSet(d.diffs, validDiffs) or Boss.diffs
+        Infinite.weathers = toSet(d.weathers, validWeathers) or Infinite.weathers
+        if tonumber(d.stage) then
+            Tower.stage = math.clamp(math.floor(tonumber(d.stage)), 1, CFG.MAX_STAGE)
+        end
+        if tonumber(d.minFloor) then
+            Infinite.minFloor = math.max(1, math.floor(tonumber(d.minFloor)))
+        end
+        -- boss cooldowns still running (absolute times, so they stay valid after a relaunch)
+        if type(d.cooldowns) == "table" then
+            local now = os.time()
+            for k, v in pairs(d.cooldowns) do
+                if type(k) == "string" and type(v) == "number" and v > now then Boss.cooldown[k] = v end
+            end
+        end
+    end
+
+    -- =====================================================================
+    -- == 5. GENERIC HELPERS
+    -- =====================================================================
+    local function clean(t) return (tostring(t):gsub("<[^>]+>", "")) end
+
+    -- true when the object and all its parents are visible / enabled
+    local function shown(o)
+        local x = o
+        while x and x ~= game do
+            if x:IsA("LayerCollector") then -- ScreenGui, BillboardGui, SurfaceGui
+                if not x.Enabled then return false end
+            elseif x:IsA("GuiObject") then
+                if not x.Visible then return false end
+            end
+            x = x.Parent
+        end
+        return true
+    end
+
+    -- "boss_rimuru" -> "Rimuru", "hw_seras_integra" -> "Seras Integra"
+    local function niceName(id)
+        local n = id:gsub("^boss_", ""):gsub("^hw_", ""):gsub("_npc$", ""):gsub("_", " ")
+        return (n:gsub("(%a)([%w]*)", function(f, r) return f:upper() .. r end))
+    end
+
+    local function getHRP()
+        return player.Character and player.Character:FindFirstChild("HumanoidRootPart")
+    end
+
+    local function logEnd(tag, data)
+        pcall(function()
+            print("[PibbleHub] BattleEnd (" .. tag .. "):", HttpService:JSONEncode(data))
+        end)
+    end
+
+    local function b64decode(data)
+        local alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
+        local map = {}
+        for i = 1, #alphabet do map[alphabet:byte(i)] = i - 1 end
+        local out, buf, bits = {}, 0, 0
+        for i = 1, #data do
+            local v = map[data:byte(i)]
+            if v then
+                buf = buf * 64 + v
+                bits += 6
+                if bits >= 8 then
+                    bits -= 8
+                    local byte = math.floor(buf / 2 ^ bits)
+                    buf = buf - byte * 2 ^ bits
+                    out[#out + 1] = string.char(byte)
+                end
+            end
+        end
+        return table.concat(out)
+    end
+
+    -- =====================================================================
+    -- == 6. WINDOW & UI BUILDERS
+    -- =====================================================================
+    local guiParent = (gethui and gethui()) or game:GetService("CoreGui")
+    for _, n in ipairs({"PibbleHub", "HalloweenUI"}) do
+        local old = guiParent:FindFirstChild(n)
+        if old then old:Destroy() end
+    end
+
+    local gui = Instance.new("ScreenGui")
+    gui.Name = "PibbleHub"
+    gui.ResetOnSpawn = false
+    gui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
+    gui.Parent = guiParent
+
+    local win = Instance.new("Frame")
+    win.Size = UDim2.fromOffset(250, 566)
+    win.Position = UDim2.new(0, 30, 0.3, 0)
+    win.BackgroundColor3 = Color3.fromRGB(26, 14, 38)
+    win.BorderSizePixel = 0
+    win.Active = true
+    win.Draggable = true
+    win.ZIndex = 1
+    win.Parent = gui
+    Instance.new("UICorner", win)
+
+    local function label(text, y, color, size)
+        local l = Instance.new("TextLabel")
+        l.Size = UDim2.new(1, -20, 0, 20)
+        l.Position = UDim2.fromOffset(10, y)
+        l.BackgroundTransparency = 1
+        l.Font = FONT
+        l.TextSize = size or 16
+        l.TextColor3 = color or Color3.new(1, 1, 1)
+        l.TextXAlignment = Enum.TextXAlignment.Left
+        l.Text = text
+        l.ZIndex = 5
+        l.Parent = win
+        return l
+    end
+
+    local function button(text, x, y, w, h, color, parentFrame, z)
+        local b = Instance.new("TextButton")
+        b.Size = UDim2.fromOffset(w, h)
+        b.Position = UDim2.fromOffset(x, y)
+        b.BackgroundColor3 = color
+        b.BorderSizePixel = 0
+        b.Font = FONT
+        b.TextSize = 15
+        b.TextColor3 = Color3.new(1, 1, 1)
+        b.Text = text
+        b.ZIndex = z or 5
+        b.Parent = parentFrame or win
+        Instance.new("UICorner", b)
+        return b
+    end
+
+    local function textbox(placeholder, x, y, w, h, text, size)
+        local t = Instance.new("TextBox")
+        t.Size = UDim2.fromOffset(w, h)
+        t.Position = UDim2.fromOffset(x, y)
+        t.BackgroundColor3 = Color3.fromRGB(45, 30, 65)
+        t.BorderSizePixel = 0
+        t.Font = FONT
+        t.TextSize = size or 16
+        t.TextColor3 = Color3.new(1, 1, 1)
+        t.PlaceholderText = placeholder
+        t.PlaceholderColor3 = Color3.fromRGB(150, 140, 170)
+        t.ClearTextOnFocus = true
+        t.Text = text or ""
+        t.ZIndex = 5
+        t.Parent = win
+        Instance.new("UICorner", t)
+        return t
+    end
+
+    -- Dropdown panel that opens to the right of the window
+    local function sidePanel(className, w, h, y)
+        local f = Instance.new(className)
+        f.Size = UDim2.fromOffset(w, h)
+        f.Position = UDim2.fromOffset(258, y)
+        f.BackgroundColor3 = Color3.fromRGB(36, 22, 52)
+        f.BorderSizePixel = 0
+        f.Visible = false
+        f.ZIndex = 20
+        f.Parent = win
+        Instance.new("UICorner", f)
+        return f
+    end
+
+    label("PibbleHub", 5, ORANGE, 20)
+
+    -- Open / collapse button (square, rounded corners): the embedded icon, or a "P"
+    do
+        local iconId = CFG.ICON_ID
+        if iconId == "" then
+            pcall(function()
+                if writefile and getcustomasset then
+                    writefile("pibblehub_icon.jpg", b64decode(ICON_B64))
+                    iconId = getcustomasset("pibblehub_icon.jpg")
+                end
+            end)
+        end
+
+        local toggle
+        if iconId ~= "" then
+            toggle = Instance.new("ImageButton")
+            toggle.Image = iconId
+            toggle.ScaleType = Enum.ScaleType.Crop
+        else
+            toggle = Instance.new("TextButton")
+            toggle.Font = FONT
+            toggle.TextSize = 22
+            toggle.TextColor3 = ORANGE
+            toggle.Text = "P"
+        end
+        toggle.Name = "ToggleButton"
+        toggle.Size = UDim2.fromOffset(44, 44)
+        toggle.Position = UDim2.new(0, 30, 0.3, -52)
+        toggle.BackgroundColor3 = Color3.fromRGB(26, 14, 38)
+        toggle.BorderSizePixel = 0
+        toggle.Active = true
+        toggle.Draggable = true
+        toggle.ZIndex = 50
+        toggle.Parent = gui
+        Instance.new("UICorner", toggle).CornerRadius = UDim.new(0, 12)
+        local stroke = Instance.new("UIStroke", toggle)
+        stroke.Color = ORANGE
+        stroke.Thickness = 2
+        toggle.MouseButton1Click:Connect(function()
+            win.Visible = not win.Visible
+        end)
+    end
+
+    -- =====================================================================
+    -- == 7. GUI AUTOMATION HELPERS (find / press the game's own buttons)
+    -- =====================================================================
+    local function btnText(o)
+        if o:IsA("TextButton") or o:IsA("TextLabel") then return clean(o.Text):lower() end
+        return ""
+    end
+
+    -- First visible button whose text matches pred (a hidden one is used as a fallback)
+    local function findButton(pred)
+        local pg = player:FindFirstChild("PlayerGui")
+        if not pg then return nil end
+        local best
+        for _, d in ipairs(pg:GetDescendants()) do
+            if d ~= gui and not d:IsDescendantOf(gui) and pred(btnText(d)) then
+                -- a label inside a button: use the button
+                local b = d
+                if not (b:IsA("TextButton") or b:IsA("ImageButton")) then
+                    b = d:FindFirstAncestorWhichIsA("TextButton") or d:FindFirstAncestorWhichIsA("ImageButton")
+                end
+                if b then
+                    if shown(b) then return b end
+                    best = best or b
+                end
+            end
+        end
+        return best
+    end
+
+    -- Fires the button's real click handlers
+    local function activateButton(b)
+        local fired = false
+        for _, sig in ipairs({"MouseButton1Click", "Activated"}) do
+            if typeof(firesignal) == "function" then
+                if pcall(function() firesignal(b[sig]) end) then fired = true end
+            elseif typeof(getconnections) == "function" then
+                pcall(function()
+                    for _, c in ipairs(getconnections(b[sig])) do c:Fire(); fired = true end
+                end)
+            end
+            if fired then break end
+        end
+        return fired
+    end
+
+    -- Some games ask "are you sure?": press Yes / Confirm if it appears
+    local function confirmDialog()
+        local b = findButton(function(t)
+            return t == "yes" or t == "confirm" or t == "give up!" or t:find("^yes[%s%p]") ~= nil
+        end)
+        if b and shown(b) then activateButton(b) end
+    end
+
+    -- =====================================================================
+    -- == 7b. ANTI-AFK
+    -- =====================================================================
+    -- Roblox fires Players.LocalPlayer.Idled after ~20 min without input:
+    -- we answer with a virtual click so the player is never kicked for being idle.
+    do
+        local VirtualUser = game:GetService("VirtualUser")
+        pcall(function()
+            local genv = (getgenv and getgenv()) or _G
+            -- if the script is launched again, drop the previous connection (no stacking)
+            if genv.PibbleAFK then genv.PibbleAFK:Disconnect() end
+            genv.PibbleAFK = player.Idled:Connect(function()
+                pcall(function()
+                    VirtualUser:CaptureController()
+                    VirtualUser:ClickButton2(Vector2.new())
+                end)
+            end)
+        end)
+    end
+
+    -- =====================================================================
+    -- == 7c. WORLD TELEPORT (Auto Boss: every boss NPC lives in its own world)
+    -- =====================================================================
+    local Worlds = {}
+    do
+        local function norm(s) return (tostring(s):lower():gsub("[^%w]+", "")) end
+
+        local function textOf(x)
+            if x:IsA("TextButton") then return clean(x.Text) end
+            for _, c in ipairs(x:GetDescendants()) do
+                if c:IsA("TextLabel") then return clean(c.Text) end
+            end
+            return ""
+        end
+
+        -- The world list has one "World_<id>" card per world (a title + an "Enter" button).
+        -- The card is found by its id ("World_namek") or by its title ("Namek"); returns card, id.
+        local function findCard(name)
+            local pg = player:FindFirstChild("PlayerGui")
+            if not pg then return nil end
+            local want = norm(name)
+            for _, d in ipairs(pg:GetDescendants()) do
+                if not d:IsDescendantOf(gui) and d.Name:sub(1, 6) == "World_" then
+                    local id = d.Name:sub(7)
+                    if norm(id) == want then return d, id end
+                    for _, c in ipairs(d:GetDescendants()) do
+                        if c:IsA("TextLabel") then
+                            local n = norm(c.Text)
+                            if n == want or (#want >= 4 and n:find(want, 1, true)) then return d, id end
+                        end
+                    end
+                end
+            end
+            return nil
+        end
+
+        local function enterButton(card)
+            local hidden
+            for _, x in ipairs(card:GetDescendants()) do
+                if (x:IsA("TextButton") or x:IsA("ImageButton")) and textOf(x):lower():find("enter", 1, true) then
+                    if shown(x) then return x end
+                    hidden = hidden or x
+                end
+            end
+            return hidden
+        end
+
+        -- Teleports to a world by its name ("Leaf Village", "Namek"...): presses the Enter button of its card
+        -- (opening the worlds menu first if needed), or fires TeleportToWorld with the id read from the card.
+        -- useRemote = true tries the remote first. Returns the method used (nil if nothing worked).
+        function Worlds.go(name, useRemote)
+            local card, id = findCard(name)
+            if not card then
+                local m = findButton(function(t)
+                    return t:find("teleport", 1, true) ~= nil or t == "world" or t == "worlds"
+                end)
+                if m and activateButton(m) then
+                    task.wait(0.6)
+                    card, id = findCard(name)
+                end
+            end
+            print("[PibbleHub] world teleport:", name, "| card =", card and card:GetFullName() or "not found")
+            local guess = id or (name:lower():gsub("%s+", "_"))
+            if useRemote and Remotes.Teleport then
+                Remotes.Teleport:FireServer(guess)
+                return "remote"
+            end
+            local b = card and enterButton(card)
+            if b and activateButton(b) then
+                task.wait(0.6)
+                confirmDialog()
+                return "button"
+            end
+            if Remotes.Teleport then
+                Remotes.Teleport:FireServer(guess)
+                return "remote"
+            end
+            return nil
+        end
+    end
+
+    -- =====================================================================
+    -- == 8. FEATURE: CANDY COLLECTOR
+    -- =====================================================================
+    do
+        label("Candy Collector", 30, ORANGE)
+        local statusL = label("Status: idle", 50)
+        local timerL = label("Respawn: -", 70)
+        local countL = label("Collected: 0", 90)
+        local goBtn = button("Collect now", 10, 114, 105, 26, BLUE)
+        local autoBtn = button("Auto: OFF", 125, 114, 115, 26, RED)
+
+        local lastLobbyTp, tpAttempt = 0, 0
+
+        Remotes.CandyState.OnClientEvent:Connect(function(t, now)
+            if type(now) == "number" then Candy.offset = now - os.time() end
+            Candy.state = type(t) == "table" and t or {}
+        end)
+
+        local function serverNow() return os.time() + Candy.offset end
+
+        local function refresh()
+            Remotes.RequestCandy:FireServer()
+            task.wait(1.5)
+        end
+
+        -- Candies only exist in the lobby: if none are loaded around us, we are somewhere else
+        local function inLobby()
+            return #CS:GetTagged("PickupCandy") > 0
+        end
+
+        -- Candies respawn on a timer (10 min): ready when the earliest respawn time has passed
+        local function candiesReady()
+            if os.clock() - Candy.lastRun < 15 then return false end
+            if Candy.nextT == nil then return true end
+            return serverNow() >= Candy.nextT
+        end
+
+        -- ---- lobby teleport ----
+        local function labelOf(x)
+            if x:IsA("TextButton") then return clean(x.Text):lower() end
+            for _, c in ipairs(x:GetDescendants()) do
+                if c:IsA("TextLabel") then return clean(c.Text):lower() end
+            end
+            return ""
+        end
+
+        -- The world list shows one card per world: a "Lobby" title and an "Enter" button.
+        local function findLobbyEnter()
+            local pg = player:FindFirstChild("PlayerGui")
+            if not pg then return nil end
+            -- the game's world list: PlayerGui.WorldsGui.WorldsFrame.WorldList.World_lobby
+            local card = pg:FindFirstChild("World_lobby", true)
+            if card then
+                local hidden
+                for _, x in ipairs(card:GetDescendants()) do
+                    if x:IsA("TextButton") or x:IsA("ImageButton") then
+                        if labelOf(x):find("enter", 1, true) then
+                            if shown(x) then return x end
+                            hidden = hidden or x
+                        end
+                    end
+                end
+                if hidden then return hidden end
+            end
+            -- fallback: the smallest container holding a "Lobby" title and an "Enter" button
+            for _, d in ipairs(pg:GetDescendants()) do
+                if (d:IsA("TextLabel") or d:IsA("TextButton")) and not d:IsDescendantOf(gui)
+                    and clean(d.Text):lower():match("^%s*lobby%s*$") then
+                    local a = d.Parent
+                    while a and not a:IsA("ScreenGui") do
+                        local hidden
+                        for _, x in ipairs(a:GetDescendants()) do
+                            if (x:IsA("TextButton") or x:IsA("ImageButton")) and x ~= d
+                                and labelOf(x):find("enter", 1, true) then
+                                if shown(x) then return x end
+                                hidden = hidden or x
+                            end
+                        end
+                        if hidden then return hidden end
+                        a = a.Parent
+                    end
+                end
+            end
+            return nil
+        end
+
+        -- Presses the Enter button of the Lobby card (opening the worlds menu first if needed) and confirms
+        -- any popup. Every second attempt fires the TeleportToWorld remote instead. Returns the method used.
+        local function teleportLobby()
+            tpAttempt += 1
+            if tpAttempt % 2 == 0 and Remotes.Teleport then
+                print("[PibbleHub] lobby teleport: remote TeleportToWorld('lobby')")
+                Remotes.Teleport:FireServer("lobby")
+                return "remote"
+            end
+            local b = findLobbyEnter()
+            if not b then
+                -- open the menu that lists the worlds, then look again
+                local m = findButton(function(t)
+                    return t:find("teleport", 1, true) ~= nil or t == "world" or t == "worlds" or t == "lobby"
+                end)
+                if m and activateButton(m) then
+                    task.wait(0.6)
+                    b = findLobbyEnter()
+                end
+            end
+            print("[PibbleHub] lobby teleport: Enter button =", b and b:GetFullName() or "not found")
+            if b and activateButton(b) then
+                task.wait(0.6)
+                confirmDialog()
+                return "button"
+            end
+            if Remotes.Teleport then
+                Remotes.Teleport:FireServer("lobby")
+                return "remote"
+            end
+            return nil
+        end
+
+        -- Makes sure we are in the lobby. Never pulls the player out of a running Auto Tower / Auto Boss.
+        local function goLobby()
+            if inLobby() then return true end
+            if Tower.auto or Boss.active then
+                statusL.Text = "Status: not in lobby (tower/boss running)"
+                return false
+            end
+            if os.clock() - lastLobbyTp > 15 then
+                lastLobbyTp = os.clock()
+                statusL.Text = "Status: teleporting to lobby"
+                local method = teleportLobby()
+                if not method then
+                    statusL.Text = "Status: no lobby button found"
+                    return false
+                end
+                statusL.Text = "Status: teleporting (" .. method .. ")"
+            end
+            -- wait for the lobby (and its candies) to load
+            for _ = 1, 20 do
+                if inLobby() then
+                    for _ = 1, 10 do
+                        if getHRP() then break end
+                        task.wait(0.5)
+                    end
+                    task.wait(1)
+                    return true
+                end
+                task.wait(0.5)
+            end
+            statusL.Text = "Status: lobby not reached"
+            return false
+        end
+
+        Candy.goLobby = goLobby
+
+        -- ---- collect run ----
+        local function run()
+            if Candy.busy then return end
+            Candy.busy = true
+            Candy.lastRun = os.clock()
+            if not goLobby() then
+                Candy.busy = false
+                return
+            end
+            local hrp = getHRP()
+            if not hrp then
+                statusL.Text = "Status: character not found"
+                Candy.busy = false
+                return
+            end
+
+            local back = hrp.CFrame
+            local tried = {}
+
+            local function confirm()
+                for id in pairs(tried) do
+                    local ready = Candy.state[id]
+                    if ready and ready > serverNow() then
+                        Candy.total += 1
+                        tried[id] = nil
+                    end
+                end
+                countL.Text = "Collected: " .. Candy.total
+            end
+
+            for attempt = 1, 3 do
+                statusL.Text = "Status: updating (" .. attempt .. "/3)"
+                refresh()
+                confirm()
+                Candy.nextT = nil
+                local pending = 0
+
+                for _, model in ipairs(CS:GetTagged("PickupCandy")) do
+                    local id = model:GetAttribute("CandyId")
+                    if type(id) == "string" then
+                        local ready = Candy.state[id]
+                        if ready and ready > serverNow() then
+                            Candy.nextT = Candy.nextT and math.min(Candy.nextT, ready) or ready
+                        else
+                            local okBox, cf = pcall(function() return model:GetBoundingBox() end)
+                            if okBox then
+                                pending += 1
+                                tried[id] = true
+                                statusL.Text = "Collecting: " .. id
+                                hrp.CFrame = CFrame.new(cf.Position + Vector3.new(0, 12, 0))
+                                task.wait(0.4)
+                                hrp.CFrame = CFrame.new(cf.Position)
+                                task.wait(0.4)
+                            end
+                        end
+                    end
+                end
+
+                if pending == 0 then break end
+            end
+
+            refresh()
+            confirm()
+            for id in pairs(tried) do print("Failed:", id) end
+            hrp.CFrame = back
+            statusL.Text = Candy.auto and "Status: auto running" or "Status: done"
+            Candy.busy = false
+        end
+
+        -- Used by Auto Boss between two fights: collect the candies right away if their timer is up
+        Candy.runIfReady = function()
+            if Candy.auto and not Candy.busy and candiesReady() then run() end
+        end
+
+        local function setAuto(on)
+            Candy.auto = on
+            autoBtn.Text = on and "Auto: ON" or "Auto: OFF"
+            autoBtn.BackgroundColor3 = on and GREEN or RED
+            Settings.save()
+        end
+        Candy.setAuto = setAuto
+
+        goBtn.MouseButton1Click:Connect(function() task.spawn(run) end)
+        autoBtn.MouseButton1Click:Connect(function() setAuto(not Candy.auto) end)
+
+        -- every second: respawn timer + auto collect
+        task.spawn(function()
+            while gui.Parent do
+                task.wait(1)
+                if Candy.nextT then
+                    local left = math.max(0, Candy.nextT - serverNow())
+                    timerL.Text = ("Respawn: %dm %02ds"):format(left // 60, left % 60)
+                end
+                -- never interrupt a boss fight: bosses first, the candies are collected right after
+                if Candy.auto and not Candy.busy and not Boss.active then
+                    if candiesReady() then
+                        task.spawn(run)
+                    elseif not inLobby() and not Boss.auto and not Tower.auto then
+                        task.spawn(run) -- Candy is ON and nothing else is running: stay in the lobby
+                    end
+                end
+            end
+        end)
+    end
+
+    -- =====================================================================
+    -- == 9. FEATURE: HALLOWEEN TOWER
+    -- =====================================================================
+    do
+        label("Halloween Tower", 152, ORANGE)
+        local floorLbl = label("Floors 1-5", 172)
+        local statusL = label("Tower: idle", 192)
+        local minusBtn = button("-", 10, 218, 36, 28, DARK)
+        local floorBox = textbox("Floor (1-500)", 52, 218, 122, 28, "1", 16)
+        local plusBtn = button("+", 180, 218, 36, 28, DARK)
+        local startBtn = button("Start", 10, 258, 105, 28, BLUE)
+        local autoBtn = button("Auto: OFF", 125, 258, 115, 28, RED)
+
+        local hiddenObjs = {}
+        local panel, lastScan = nil, 0
+
+        -- ---- floor selection ----
+        local function firstFloor(s) return (s - 1) * 5 + 1 end
+
+        local function setStage(s)
+            Tower.stage = math.clamp(math.floor(s), 1, CFG.MAX_STAGE)
+            local a = firstFloor(Tower.stage)
+            floorBox.Text = tostring(a)
+            floorLbl.Text = ("Floors %d-%d"):format(a, a + 4)
+            Settings.save()
+        end
+
+        local function readBox()
+            local n = tonumber(floorBox.Text)
+            if n then setStage(math.ceil(math.clamp(math.floor(n), 1, CFG.MAX_FLOOR) / 5)) end
+        end
+
+        -- ---- start a group of 5 floors ----
+        local function fireBind(name, ...)
+            local pg = player:FindFirstChild("PlayerGui")
+            local b = pg and pg:FindFirstChild(name)
+            if b and b:IsA("BindableEvent") then b:Fire(...) end
+        end
+
+        local function enterStage(s, isAuto)
+            local m = firstFloor(s)
+            local suffix = Tower.slot == 2 and "2" or ""
+            -- same calls the game's own Enter button makes
+            fireBind("ResetBattleFloor" .. suffix, m, "infinite_room")
+            fireBind("StartInfiniteRoomBattle" .. suffix, m, "halloween", isAuto or nil)
+            Remotes.StartBattle:FireServer("infinite_room", {
+                tower = "halloween",
+                milestone = m,
+                slot = Tower.slot,
+            })
+            statusL.Text = ("Tower: started %d-%d"):format(m, m + 4)
+        end
+
+        local function relaunch()
+            task.delay(CFG.AUTO_DELAY, function()
+                if Tower.auto and gui.Parent then enterStage(Tower.stage, true) end
+            end)
+        end
+
+        -- ---- hide the game's tower UI while auto runs, so it doesn't pop up again ----
+        local function hideObj(o)
+            if o:IsA("ScreenGui") then
+                if o.Enabled then o.Enabled = false; hiddenObjs[o] = true end
+            elseif o:IsA("GuiObject") then
+                if o.Visible then o.Visible = false; hiddenObjs[o] = true end
+            end
+        end
+
+        -- Finds the tower window only: the smallest frame that contains BOTH the
+        -- "Enter Tower" button and the "Floors x-y" list. Other UIs are never matched.
+        local function findTowerPanel(pg)
+            for _, d in ipairs(pg:GetDescendants()) do
+                if (d:IsA("TextButton") or d:IsA("TextLabel"))
+                    and tostring(d.Text):lower():find("enter tower", 1, true) then
+                    local a = d.Parent
+                    while a and not a:IsA("ScreenGui") do
+                        if a:IsA("GuiObject") then
+                            for _, x in ipairs(a:GetDescendants()) do
+                                if (x:IsA("TextLabel") or x:IsA("TextButton"))
+                                    and tostring(x.Text):find("^%s*[Ff]loors?%s+%d") then
+                                    return a
+                                end
+                            end
+                        end
+                        a = a.Parent
+                    end
+                end
+            end
+        end
+
+        local function hideTowerGui()
+            pcall(function()
+                local pg = player:FindFirstChild("PlayerGui")
+                if not pg then return end
+                -- the tower's own gui, if it exists under this name
+                local g = pg:FindFirstChild("HalloweenTowerGui")
+                if g then hideObj(g) end
+                -- the tower window found by content (cached, rescanned at most once per second)
+                if not (panel and panel.Parent) and os.clock() - lastScan > 1 then
+                    lastScan = os.clock()
+                    panel = findTowerPanel(pg)
+                end
+                if panel and panel.Parent then hideObj(panel) end
+            end)
+        end
+
+        local function restoreTowerGui()
+            for o in pairs(hiddenObjs) do
+                if o.Parent then
+                    pcall(function()
+                        if o:IsA("ScreenGui") then o.Enabled = true else o.Visible = true end
+                    end)
+                end
+                hiddenObjs[o] = nil
+            end
+        end
+
+        local function stopAuto(msg)
+            Tower.auto = false
+            restoreTowerGui()
+            autoBtn.Text = "Auto: OFF"
+            autoBtn.BackgroundColor3 = RED
+            if msg then statusL.Text = msg end
+            Settings.save()
+        end
+
+        local function startAuto()
+            readBox()
+            Tower.auto = true
+            autoBtn.Text = "Auto: ON"
+            autoBtn.BackgroundColor3 = GREEN
+            enterStage(Tower.stage, true)
+            Settings.save()
+            -- keep the tower UI hidden while auto runs
+            task.spawn(function()
+                while Tower.auto and gui.Parent do
+                    hideTowerGui()
+                    task.wait(0.25)
+                end
+            end)
+        end
+        Tower.startAuto = startAuto
+
+        -- ---- wiring ----
+        minusBtn.MouseButton1Click:Connect(function() setStage(Tower.stage - 1) end)
+        plusBtn.MouseButton1Click:Connect(function() setStage(Tower.stage + 1) end)
+        floorBox.FocusLost:Connect(function()
+            local n = tonumber(floorBox.Text)
+            if n then readBox() else setStage(Tower.stage) end
+        end)
+
+        startBtn.MouseButton1Click:Connect(function()
+            readBox()
+            enterStage(Tower.stage, false)
+        end)
+
+        autoBtn.MouseButton1Click:Connect(function()
+            if Tower.auto then
+                stopAuto("Tower: auto stopped")
+            else
+                startAuto()
+            end
+        end)
+
+        -- The server answers OpenHalloweenTower with (clearedFloor, slot, pausedRun):
+        -- keeps Tower.slot up to date when the game opens the tower UI
+        Remotes.OpenTower.OnClientEvent:Connect(function(cleared, slot)
+            Tower.slot = (slot == 2) and 2 or 1
+            statusL.Text = ("Tower: UI open (cleared %s, slot %d)"):format(tostring(cleared or 0), Tower.slot)
+            if Tower.auto then task.defer(hideTowerGui) end
+        end)
+
+        -- called by the BattleEnd router for Halloween Tower results
+        Tower.onBattleEnd = function(data)
+            statusL.Text = ("Tower: floor %s %s"):format(tostring(data.floor), tostring(data.result))
+            if not Tower.auto then return end
+            task.defer(hideTowerGui)
+            -- loss: relaunch the same stage. milestone_complete: win, relaunch the same stage.
+            -- (any other result = a single floor won, the group continues)
+            if LOSS[tostring(data.result):lower()] or data.result == "milestone_complete" then
+                relaunch()
+            end
+        end
+
+        setStage(Tower.stage)
+    end
+
+    -- =====================================================================
+    -- == 10. FEATURE: AUTO BOSS
+    -- =====================================================================
+    do
+        label("Auto Boss", 298, ORANGE)
+        local statusL = label("Boss: idle", 318)
+        local pickBtn = button("Boss: -", 10, 342, 230, 28, DARK)
+        local diffBtn = button("Difficulty: Normal", 10, 376, 230, 28, DARK)
+        local startBtn = button("Start", 10, 410, 105, 28, BLUE)
+        local autoBtn = button("Auto: OFF", 125, 410, 115, 28, RED)
+
+        -- ---- boss menu (multi-select, stays open) ----
+        local bossMenu = sidePanel("ScrollingFrame", 270, 380, 298)
+        bossMenu.ScrollBarThickness = 6
+
+        local bossBtns, bossLabels, y = {}, {}, 6
+
+        local function refreshBossPick()
+            local n, last = 0, nil
+            for id, btn in pairs(bossBtns) do
+                local on = Boss.selected[id] == true
+                if on then n += 1; last = id end
+                btn.BackgroundColor3 = on and GREEN or DARK
+                btn.Text = (on and "[x] " or "[  ] ") .. bossLabels[id]
+            end
+            if n == 0 then
+                pickBtn.Text = "Boss: none selected"
+            elseif n == 1 then
+                pickBtn.Text = "Boss: " .. niceName(last)
+            else
+                pickBtn.Text = ("Boss: %d selected"):format(n)
+            end
+        end
+
+        for _, w in ipairs(BOSS_WORLDS) do
+            local h = Instance.new("TextLabel")
+            h.Size = UDim2.fromOffset(250, 22)
+            h.Position = UDim2.fromOffset(10, y)
+            h.BackgroundTransparency = 1
+            h.Font = FONT
+            h.TextSize = 16
+            h.TextColor3 = ORANGE
+            h.TextXAlignment = Enum.TextXAlignment.Left
+            h.Text = w[1]
+            h.ZIndex = 21
+            h.Parent = bossMenu
+            y += 25
+            for i, id in ipairs(w[2]) do
+                local txt = ("%s%s   %d/%d   (%s)"):format(niceName(id), i == #w[2] and " [BOSS]" or "",
+                    i, #w[2], tostring(FIRST_CLEAR[id] or "?"))
+                local btn = button(txt, 8, y, 254, 26, DARK, bossMenu, 21)
+                btn.TextSize = 14
+                btn.TextXAlignment = Enum.TextXAlignment.Left
+                bossBtns[id] = btn
+                bossLabels[id] = txt
+                btn.MouseButton1Click:Connect(function()
+                    if Boss.selected[id] then Boss.selected[id] = nil else Boss.selected[id] = true end
+                    refreshBossPick() -- the menu stays open so several bosses can be picked
+                    Settings.save()
+                end)
+                y += 29
+            end
+        end
+        bossMenu.CanvasSize = UDim2.fromOffset(0, y + 6)
+        refreshBossPick()
+
+        -- ---- difficulty menu (multi-select) ----
+        local diffMenu = sidePanel("Frame", 190, (#DIFFS + 1) * 32 + 4, 330)
+        local diffAllBtn = button("All difficulties", 8, 4, 174, 28, DARK, diffMenu, 21)
+        local diffBtns = {}
+        for i, d in ipairs(DIFFS) do
+            diffBtns[d] = button(d, 8, 4 + i * 32, 174, 28, DARK, diffMenu, 21)
+        end
+
+        local function refreshDiffPick()
+            local n, last = 0, nil
+            for _, d in ipairs(DIFFS) do
+                local on = Boss.diffs[d] == true
+                if on then n += 1; last = d end
+                diffBtns[d].BackgroundColor3 = on and GREEN or DARK
+                diffBtns[d].Text = (on and "[x] " or "[  ] ") .. niceName(d)
+            end
+            diffAllBtn.BackgroundColor3 = (n == #DIFFS) and GREEN or DARK
+            if n == 0 then
+                diffBtn.Text = "Difficulty: Normal"
+            elseif n == 1 then
+                diffBtn.Text = "Difficulty: " .. niceName(last)
+            elseif n == #DIFFS then
+                diffBtn.Text = "Difficulty: All (rotating)"
+            else
+                diffBtn.Text = ("Difficulty: %d selected"):format(n)
+            end
+        end
+
+        for _, d in ipairs(DIFFS) do
+            diffBtns[d].MouseButton1Click:Connect(function()
+                if Boss.diffs[d] then Boss.diffs[d] = nil else Boss.diffs[d] = true end
+                refreshDiffPick()
+                Settings.save()
+            end)
+        end
+        diffAllBtn.MouseButton1Click:Connect(function()
+            local all = true
+            for _, d in ipairs(DIFFS) do
+                if not Boss.diffs[d] then all = false end
+            end
+            Boss.diffs = {}
+            if not all then
+                for _, d in ipairs(DIFFS) do Boss.diffs[d] = true end
+            end
+            refreshDiffPick()
+            Settings.save()
+        end)
+        refreshDiffPick()
+
+        -- only one menu open at a time
+        pickBtn.MouseButton1Click:Connect(function()
+            bossMenu.Visible = not bossMenu.Visible
+            if bossMenu.Visible then diffMenu.Visible = false end
+        end)
+        diffBtn.MouseButton1Click:Connect(function()
+            diffMenu.Visible = not diffMenu.Visible
+            if diffMenu.Visible then bossMenu.Visible = false end
+        end)
+
+        -- ---- fight queue ----
+        -- For each selected boss (progression order), every selected difficulty (none = normal).
+        -- peekFight returns the next {boss, difficulty} WITHOUT advancing: the queue only moves on
+        -- (advance) when a fight is really over, so a fight that never started doesn't "consume" its slot.
+        local function fightList()
+            local diffs = {}
+            for _, d in ipairs(DIFFS) do
+                if Boss.diffs[d] then diffs[#diffs + 1] = d end
+            end
+            if #diffs == 0 then diffs = {"normal"} end
+            local list = {}
+            for _, w in ipairs(BOSS_WORLDS) do
+                for _, id in ipairs(w[2]) do
+                    if Boss.selected[id] then
+                        for _, d in ipairs(diffs) do list[#list + 1] = {id, d} end
+                    end
+                end
+            end
+            return list
+        end
+
+        local function keyOf(f) return f[1] .. "|" .. f[2] end
+
+        local function onCooldown(f)
+            local r = Boss.cooldown[keyOf(f)]
+            return r ~= nil and r > os.time()
+        end
+
+        -- next fight to run, skipping the ones that are on a cooldown timer (nil = nothing available now)
+        local function peekFight()
+            local list = fightList()
+            if #list == 0 then return nil end
+            -- a lost fight is retried: same boss, same difficulty
+            if Boss.current and Boss.retries > 0 then
+                for _, f in ipairs(list) do
+                    if keyOf(f) == keyOf(Boss.current) and not onCooldown(f) then return f end
+                end
+            end
+            -- otherwise: the first available fight after the last finished one
+            -- (still correct if the selection was changed in the meantime)
+            local idx = 0
+            if Boss.lastDone then
+                for i, f in ipairs(list) do
+                    if keyOf(f) == Boss.lastDone then idx = i end
+                end
+            end
+            for step = 1, #list do
+                local f = list[(idx + step - 1) % #list + 1]
+                if not onCooldown(f) then return f end
+            end
+            return nil
+        end
+
+        -- marks the current fight as finished: the queue resumes right after it
+        local function advance()
+            if Boss.current then Boss.lastDone = keyOf(Boss.current) end
+            Boss.retries = 0
+        end
+
+        -- ---- NPC lookup & teleport ----
+        -- Finds the NPC model in the workspace (by model name or by attribute)
+        local function findNPC(id)
+            local want, wantNice = id:lower(), niceName(id):lower()
+            for _, d in ipairs(workspace:GetDescendants()) do
+                if d:IsA("Model") and not Players:GetPlayerFromCharacter(d) then
+                    local n = d.Name:lower()
+                    local a = d:GetAttribute("NPCId") or d:GetAttribute("NpcId") or d:GetAttribute("npcId")
+                        or d:GetAttribute("Id") or d:GetAttribute("id")
+                    if n == want or n == wantNice or (a and tostring(a):lower() == want) then
+                        return d
+                    end
+                end
+            end
+        end
+
+        -- Teleports in front of the NPC (retries for ~5 s in case it is streamed in)
+        local function tpToNPC(id)
+            for _ = 1, 10 do
+                local hrp = getHRP()
+                local m = findNPC(id)
+                if hrp and m then
+                    local okP, pivot = pcall(function() return m:GetPivot() end)
+                    if okP then
+                        hrp.CFrame = CFrame.new(pivot.Position + pivot.LookVector * 5 + Vector3.new(0, 2, 0))
+                        return true
+                    end
+                end
+                task.wait(0.5)
+            end
+            print("[PibbleHub] NPC not found in workspace:", id)
+            return false
+        end
+
+        -- ---- cooldown timers ----
+        -- A boss that was cleared recently shows a timer. It is looked for in two places:
+        --   1) on the NPC itself (billboard / surface text), right after teleporting to it
+        --   2) in a popup, a few seconds after StartNPCBattle was fired
+        local UNITS = {
+            h = 3600, hr = 3600, hrs = 3600, hour = 3600, hours = 3600,
+            m = 60, min = 60, mins = 60, minute = 60, minutes = 60,
+            s = 1, sec = 1, secs = 1, second = 1, seconds = 1,
+        }
+        local TIMER_WORDS = {"cooldown", "cool down", "available in", "ready in", "try again", "come back", "again in"}
+
+        local function hasWord(t)
+            for _, w in ipairs(TIMER_WORDS) do
+                if t:find(w, 1, true) then return true end
+            end
+            return false
+        end
+
+        -- "4:32", "1:02:10", "5m 30s", "2 hours" ... -> seconds (nil when the text holds no time)
+        local function parseTime(text)
+            local h, m, s = text:match("(%d+):(%d+):(%d+)")
+            if h then return tonumber(h) * 3600 + tonumber(m) * 60 + tonumber(s) end
+            m, s = text:match("(%d+):(%d+)")
+            if m then return tonumber(m) * 60 + tonumber(s) end
+            local total, found = 0, false
+            for n, u in text:gmatch("(%d+)%s*(%a+)") do
+                local mult = UNITS[u]
+                if mult then
+                    total += tonumber(n) * mult
+                    found = true
+                end
+            end
+            return found and total or nil
+        end
+
+        local function isText(o) return o:IsA("TextLabel") or o:IsA("TextButton") end
+
+        -- timer written on the NPC (any visible text under the model that reads as a time)
+        local function npcTimer(model)
+            if not model then return nil end
+            for _, d in ipairs(model:GetDescendants()) do
+                if isText(d) and shown(d) then
+                    local t = clean(d.Text):lower()
+                    if t ~= "" then
+                        local secs = parseTime(t) or (hasWord(t) and tonumber(t:match("(%d+)")))
+                        if secs and secs > 0 then return secs end
+                    end
+                end
+            end
+            return nil
+        end
+
+        -- timer in a popup: a visible text with a "cooldown"-like word and a time
+        -- (the time may be in a sibling label: "Cooldown:" + "4:32")
+        local function popupTimer()
+            local pg = player:FindFirstChild("PlayerGui")
+            if not pg then return nil end
+            for _, d in ipairs(pg:GetDescendants()) do
+                if isText(d) and not d:IsDescendantOf(gui) and shown(d) then
+                    local t = clean(d.Text):lower()
+                    if t ~= "" and hasWord(t) then
+                        local secs = parseTime(t) or tonumber(t:match("(%d+)"))
+                        if not secs and d.Parent then
+                            for _, sib in ipairs(d.Parent:GetChildren()) do
+                                if sib ~= d and isText(sib) then
+                                    secs = parseTime(clean(sib.Text):lower())
+                                    if secs then break end
+                                end
+                            end
+                        end
+                        if secs and secs > 0 then return secs end
+                    end
+                end
+            end
+            return nil
+        end
+
+        -- debug: prints every visible text found on the NPC, to see what the game displays there
+        local function dumpTexts(id)
+            if not CFG.DEBUG_TIMER then return end
+            local m = findNPC(id)
+            if not m then return end
+            local out = {}
+            for _, d in ipairs(m:GetDescendants()) do
+                if isText(d) and shown(d) then
+                    local t = clean(d.Text)
+                    if t ~= "" then out[#out + 1] = d.Name .. "=" .. t end
+                end
+            end
+            print("[PibbleHub] texts on " .. id .. ": " .. (#out > 0 and table.concat(out, " | ") or "(none)"))
+        end
+
+        -- ---- what the server answers to StartNPCBattle ----
+        -- Every RemoteEvent the server fires at us is recorded. A refused fight (cooldown) comes back as a
+        -- text with the time, or as nothing at all; an accepted fight triggers battle events.
+        local Notice = { list = {} } -- {t = os.clock(), name = remote name, text = lowercase text}
+
+        local function collectTexts(v, out, depth)
+            if type(v) == "string" then
+                out[#out + 1] = v
+            elseif type(v) == "table" and depth < 3 then
+                for _, x in pairs(v) do collectTexts(x, out, depth + 1) end
+            end
+        end
+
+        for _, r in ipairs(R:GetDescendants()) do
+            if r:IsA("RemoteEvent") and not CFG.IGNORE_REMOTES[r.Name] then
+                r.OnClientEvent:Connect(function(...)
+                    local args, texts = table.pack(...), {}
+                    for i = 1, args.n do collectTexts(args[i], texts, 0) end
+                    local text = clean(table.concat(texts, " ")):lower()
+                    local list = Notice.list
+                    list[#list + 1] = { t = os.clock(), name = r.Name, text = text }
+                    if #list > 60 then table.remove(list, 1) end
+                    if CFG.DEBUG_TIMER and Boss.started and os.clock() - Boss.startedAt < 15 then
+                        print("[PibbleHub] server event after StartNPCBattle:", r.Name, text)
+                    end
+                end)
+            end
+        end
+
+        -- how many server events arrived since `since`
+        local function noticeCount(since)
+            local n = 0
+            for _, e in ipairs(Notice.list) do
+                if e.t >= since then n += 1 end
+            end
+            return n
+        end
+
+        -- a server message about a cooldown, with its time (seconds)
+        local function noticeTimer(since)
+            for _, e in ipairs(Notice.list) do
+                if e.t >= since and e.text ~= ""
+                    and (hasWord(e.text) or e.text:find("wait", 1, true) or e.text:find("cool", 1, true)) then
+                    local secs = parseTime(e.text)
+                    if secs and secs > 0 then return secs end
+                end
+            end
+            return nil
+        end
+
+        -- debug: visible texts of the interface that read as a time (to locate where the game shows timers)
+        local function dumpGuiTimers()
+            if not CFG.DEBUG_TIMER then return end
+            local pg = player:FindFirstChild("PlayerGui")
+            if not pg then return end
+            local out = {}
+            for _, d in ipairs(pg:GetDescendants()) do
+                if #out >= 12 then break end
+                if isText(d) and not d:IsDescendantOf(gui) and shown(d) then
+                    local t = clean(d.Text)
+                    if t ~= "" and parseTime(t:lower()) then out[#out + 1] = d.Name .. "=" .. t end
+                end
+            end
+            print("[PibbleHub] visible timers in the interface: " .. (#out > 0 and table.concat(out, " | ") or "(none)"))
+        end
+
+        -- Was the fight refused? Looks at server messages, popups and the NPC billboard.
+        -- Returns seconds, guessed(bool). A cooldown message without a readable time = UNKNOWN_COOLDOWN.
+        local function refusedTimer(id, since)
+            local secs = noticeTimer(since) or popupTimer()
+            if not secs and CFG.TRUST_NPC_TIMER then secs = npcTimer(findNPC(id)) end
+            if secs then return secs, false end
+            for _, e in ipairs(Notice.list) do
+                if e.t >= since and e.text ~= ""
+                    and (hasWord(e.text) or e.text:find("wait", 1, true) or e.text:find("cool", 1, true)) then
+                    return CFG.UNKNOWN_COOLDOWN, true
+                end
+            end
+            return nil
+        end
+
+        -- ---- per-difficulty timers, read from the NPC dialog ----
+        -- Talking to the NPC opens a dialog with one button per difficulty. A difficulty on cooldown shows
+        -- its own timer instead of its name ("9m 47s" | Medium | Hard | Extreme | Impossible | ?).
+        -- The script "talks" to the NPC, reads the 5 buttons, stores the cooldown of EVERY difficulty, then closes.
+        local function promptPos(p)
+            local par = p.Parent
+            if par and par:IsA("BasePart") then return par.Position end
+            if par and par:IsA("Attachment") then return par.WorldPosition end
+        end
+
+        -- the "Talk" prompt of the NPC (on its model, otherwise the closest prompt within 25 studs)
+        local function findTalkPrompt(id)
+            local model = findNPC(id)
+            if model then
+                for _, d in ipairs(model:GetDescendants()) do
+                    if d:IsA("ProximityPrompt") then return d end
+                end
+            end
+            local hrp = getHRP()
+            if not hrp then return nil end
+            local best, bd = nil, 25
+            for _, d in ipairs(workspace:GetDescendants()) do
+                if d:IsA("ProximityPrompt") then
+                    local pos = promptPos(d)
+                    if pos and (pos - hrp.Position).Magnitude < bd then
+                        best, bd = d, (pos - hrp.Position).Magnitude
+                    end
+                end
+            end
+            return best
+        end
+
+        local function firePrompt(prompt)
+            if typeof(fireproximityprompt) == "function" then
+                return pcall(fireproximityprompt, prompt)
+            end
+            return pcall(function()
+                prompt:InputHoldBegin()
+                task.wait((prompt.HoldDuration or 0) + 0.1)
+                prompt:InputHoldEnd()
+            end)
+        end
+
+        -- the 5 difficulty buttons of the open dialog -> {normal = secs, medium = secs, ...} (0 = available)
+        local function readDialogDiffs()
+            local pg = player:FindFirstChild("PlayerGui")
+            if not pg then return nil end
+            local groups = {}
+            for _, b in ipairs(pg:GetDescendants()) do
+                if b:IsA("TextButton") and not b:IsDescendantOf(gui) and shown(b) and b.Parent then
+                    groups[b.Parent] = groups[b.Parent] or {}
+                    table.insert(groups[b.Parent], b)
+                end
+            end
+            local isDiff = toValidSet(DIFFS)
+            for _, btns in pairs(groups) do
+                if #btns >= #DIFFS then
+                    table.sort(btns, function(a, b) return a.AbsolutePosition.X < b.AbsolutePosition.X end)
+                    local res, ok = {}, true
+                    for i, d in ipairs(DIFFS) do
+                        local t = clean(btns[i].Text):lower():match("^%s*(.-)%s*$")
+                        if isDiff[t] then
+                            res[d] = 0
+                        elseif parseTime(t) then
+                            res[d] = parseTime(t)
+                        else
+                            ok = false
+                            break
+                        end
+                    end
+                    if ok then return res end
+                end
+            end
+            return nil
+        end
+
+        -- Opens the dialog, stores the cooldown of every difficulty of this NPC, closes the dialog.
+        -- Returns true when the dialog could be read.
+        local function syncTimers(id)
+            for _ = 1, 2 do
+                local prompt = findTalkPrompt(id)
+                if prompt and firePrompt(prompt) then
+                    local res, t0 = nil, os.clock()
+                    while os.clock() - t0 < 3 do
+                        res = readDialogDiffs()
+                        if res then break end
+                        task.wait(0.3)
+                    end
+                    if res then
+                        local now, out = os.time(), {}
+                        for _, d in ipairs(DIFFS) do
+                            local k = id .. "|" .. d
+                            if res[d] > 0 then
+                                Boss.cooldown[k] = now + res[d] + CFG.TIMER_MARGIN
+                                out[#out + 1] = d .. "=" .. res[d] .. "s"
+                            else
+                                Boss.cooldown[k] = nil -- available (also corrects an old guess)
+                                out[#out + 1] = d .. "=ready"
+                            end
+                        end
+                        Settings.save()
+                        if CFG.DEBUG_TIMER then
+                            print("[PibbleHub] dialog timers " .. id .. ": " .. table.concat(out, " | "))
+                        end
+                        local close = findButton(function(t) return t:find("not ready", 1, true) ~= nil end)
+                        if close then activateButton(close) end
+                        task.wait(0.4)
+                        return true
+                    end
+                end
+                task.wait(0.5)
+            end
+            print("[PibbleHub] could not read the dialog of " .. id)
+            return false
+        end
+
+        -- ---- fight loop ----
+        local nextBoss -- forward declaration (bossFight and nextBoss call each other)
+
+        -- The boss is on a timer: remember when it is available again (saved), move the queue on.
+        -- estimated = true: the timer is a guess (the server refused without telling it)
+        local function skipOnTimer(id, diff, secs, estimated)
+            Boss.cooldown[id .. "|" .. diff] = os.time() + secs + CFG.TIMER_MARGIN
+            Settings.save()
+            print(("[PibbleHub] %s on %s (%s): %ds"):format(estimated and "assumed cooldown" or "timer", id, diff, secs))
+            Boss.active = false
+            Boss.started = false
+            advance()
+            statusL.Text = ("Boss: %s %s %d:%02d"):format(niceName(id), estimated and "refused, retry in" or "on timer", secs // 60, secs % 60)
+            if Boss.auto then
+                task.delay(1, function()
+                    if Boss.auto and gui.Parent and not Boss.active then nextBoss() end
+                end)
+            end
+        end
+
+        -- Every selected fight is on a timer: go to the lobby and wait for the first one to end
+        local function waitForTimers()
+            local function soonest()
+                local best, now = nil, os.time()
+                for _, f in ipairs(fightList()) do
+                    local r = Boss.cooldown[keyOf(f)]
+                    if not r or r <= now then return 0 end
+                    best = best and math.min(best, r - now) or (r - now)
+                end
+                return best
+            end
+
+            if not Boss.auto then -- manual Start: just say so
+                local s = math.ceil(soonest() or 0)
+                statusL.Text = ("Boss: all on timer (%d:%02d)"):format(s // 60, s % 60)
+                return
+            end
+
+            Boss.timerWait = true
+            task.spawn(function()
+                local wentLobby = false
+                while Boss.auto and gui.Parent and not Boss.active do
+                    local s = soonest()
+                    if not s or s <= 0 then break end
+                    s = math.ceil(s)
+                    statusL.Text = ("Boss: all on timer, %d:%02d"):format(s // 60, s % 60)
+                    if not wentLobby then
+                        wentLobby = true
+                        if Candy.goLobby then pcall(Candy.goLobby) end
+                    end
+                    task.wait(1)
+                end
+                Boss.timerWait = false
+                if Boss.auto and gui.Parent and not Boss.active then nextBoss() end
+            end)
+        end
+
+        -- npc id -> name of the world it lives in
+        local worldOf = {}
+        for _, w in ipairs(BOSS_WORLDS) do
+            for _, id in ipairs(w[2]) do worldOf[id] = w[1] end
+        end
+
+        -- Every NPC lives in its own world: if it is not in the workspace, travel to its world first
+        -- (1st attempt: the world's Enter button, 2nd attempt: the TeleportToWorld remote)
+        local function ensureWorld(id)
+            if findNPC(id) then return true end
+            local world = worldOf[id]
+            if not world then return true end
+            for attempt = 1, 2 do
+                statusL.Text = ("Boss: going to %s"):format(world)
+                local method = Worlds.go(world, attempt == 2)
+                if not method then
+                    statusL.Text = "Boss: no teleport for " .. world
+                    return false
+                end
+                -- wait (up to ~15 s) for the world to load and its NPC to appear
+                for _ = 1, 30 do
+                    task.wait(0.5)
+                    if findNPC(id) then
+                        task.wait(1)
+                        return true
+                    end
+                end
+            end
+            return false
+        end
+
+        local function bossFight()
+            if Boss.active or Boss.waiting or Boss.timerWait then return end
+            if not Remotes.StartNPC then
+                statusL.Text = "StartNPCBattle not found"
+                return
+            end
+            local pick = peekFight()
+            if not pick then
+                if #fightList() == 0 then
+                    statusL.Text = "Boss: select at least one"
+                else
+                    waitForTimers() -- everything selected is on a timer: lobby + wait
+                end
+                return
+            end
+            local id, diff = pick[1], pick[2]
+
+            Boss.waiting = true
+            while Candy.busy do task.wait(0.5) end -- a candy run is in progress: let it finish first
+            Boss.waiting = false
+            Boss.active = true
+            Boss.started = false -- BattleEnd events are ignored until StartNPCBattle is really fired
+            Boss.current = pick
+            Boss.run += 1
+            local myRun = Boss.run
+
+            statusL.Text = "Boss: going to " .. niceName(id)
+            if not (ensureWorld(id) and tpToNPC(id)) then
+                Boss.active = false
+                advance() -- skip this NPC so the next selected boss can run
+                statusL.Text = "Boss: NPC not found (" .. id .. ")"
+                if Boss.auto then
+                    task.delay(CFG.AUTO_DELAY * 2, function()
+                        if Boss.auto and gui.Parent and not Boss.active then nextBoss() end
+                    end)
+                end
+                return
+            end
+            task.wait(0.3)
+
+            -- 1) talk to the NPC and read the timer of EVERY difficulty (each one has its own cooldown)
+            local synced = syncTimers(id)
+            if synced and onCooldown(pick) then
+                local left = Boss.cooldown[keyOf(pick)] - os.time()
+                skipOnTimer(id, diff, math.max(1, left - CFG.TIMER_MARGIN))
+                return
+            end
+
+            -- 2) set the difficulty, like the game's own menu does
+            if Remotes.SetNPCDiff then
+                Remotes.SetNPCDiff:FireServer(id, diff)
+                task.wait(1.5) -- leave the server time to apply it, otherwise the fight starts on the old difficulty
+            end
+
+            -- fallback when the dialog could not be read: the timer above the NPC (only if TRUST_NPC_TIMER)
+            if not synced then
+                dumpTexts(id)
+                local pre = CFG.TRUST_NPC_TIMER and npcTimer(findNPC(id)) or nil
+                if pre then
+                    skipOnTimer(id, diff, pre)
+                    return
+                end
+            end
+
+            Boss.started = true
+            Boss.startedAt = os.clock()
+            Remotes.StartNPC:FireServer(id)
+            statusL.Text = ("Boss: fighting %s (%s)"):format(id, diff)
+
+            -- post-check: poll for a few seconds. A refused fight shows a timer (server message,
+            -- popup or NPC billboard), or the server stays completely silent.
+            local since = Boss.startedAt
+            local deadline = os.clock() + CFG.TIMER_CHECK_DELAY
+            while os.clock() < deadline do
+                if not (Boss.active and Boss.run == myRun) then return end -- fight already ended/handled
+                local secs, guessed = refusedTimer(id, since)
+                if secs then
+                    skipOnTimer(id, diff, secs, guessed)
+                    return
+                end
+                task.wait(0.25)
+            end
+            if Boss.active and Boss.run == myRun
+                and CFG.REFUSE_IF_SILENT and noticeCount(since) == 0 then
+                dumpGuiTimers()
+                skipOnTimer(id, diff, CFG.UNKNOWN_COOLDOWN, true) -- refused without a word: put it aside
+                return
+            end
+
+            task.delay(CFG.BOSS_TIMEOUT, function()
+                if Boss.active and Boss.run == myRun and gui.Parent then
+                    Boss.active = false
+                    advance()
+                    statusL.Text = "Boss: no end event (timeout)"
+                    if Boss.auto then nextBoss() end
+                end
+            end)
+        end
+
+        -- Bosses have priority. Between two fights, if the candy timer is up, the candies are collected right away.
+        nextBoss = function()
+            if Candy.runIfReady then Candy.runIfReady() end
+            if Boss.auto and gui.Parent and not Boss.active then bossFight() end
+        end
+
+        startBtn.MouseButton1Click:Connect(function()
+            if not Boss.active then bossFight() end
+        end)
+
+        local function setAuto(on)
+            Boss.auto = on
+            autoBtn.Text = on and "Auto: ON" or "Auto: OFF"
+            autoBtn.BackgroundColor3 = on and GREEN or RED
+            Settings.save()
+            if on and not Boss.active then bossFight() end
+        end
+        Boss.setAuto = setAuto
+
+        autoBtn.MouseButton1Click:Connect(function() setAuto(not Boss.auto) end)
+
+        -- called by the BattleEnd router: returns true when the result belonged to a boss fight
+        Boss.onBattleEnd = function(data)
+            if not Boss.active then
+                -- duplicate of a result we just handled: swallow it (it must not count as anything else)
+                return os.clock() - Boss.lastEnd < 5
+            end
+            -- not started yet, or too early: stale result of the PREVIOUS fight, it is not ours
+            if not Boss.started or os.clock() - Boss.startedAt < CFG.BOSS_MIN_FIGHT then
+                logEnd("boss (ignored, stale)", data)
+                return true
+            end
+            Boss.active = false
+            Boss.lastEnd = os.clock()
+            if LOSS[tostring(data.result):lower()] and Boss.retries < CFG.BOSS_RETRIES then
+                -- lost: same boss, same difficulty again (the queue does not move)
+                Boss.retries += 1
+                statusL.Text = ("Boss: lost, retry %d/%d"):format(Boss.retries, CFG.BOSS_RETRIES)
+            else
+                advance() -- move to the next fight only now that this one is really over
+                statusL.Text = ("Boss: %s"):format(tostring(data.result))
+            end
+            logEnd("boss", data)
+            if Boss.auto then
+                task.delay(CFG.AUTO_DELAY, function()
+                    if Boss.auto and gui.Parent and not Boss.active then nextBoss() end
+                end)
+            end
+            return true
+        end
+    end
+
+    -- =====================================================================
+    -- == 11. FEATURE: INFINITE TOWER (auto give up when a weather appears)
+    -- =====================================================================
+    do
+        label("Infinite Tower", 450, ORANGE)
+        local statusL = label("Auto give up: idle", 470)
+        local weatherBtn = button("Weather: Any", 10, 494, 230, 28, DARK)
+        local popBtn = button("Pop: OFF", 10, 530, 105, 28, RED)
+        local minBox = textbox("Min floor", 125, 530, 115, 28, tostring(Infinite.minFloor), 15)
+
+        -- ---- weather menu (multi-select) ----
+        local ITEM_H, ITEM_GAP = 28, 4
+        local weatherMenu = sidePanel("Frame", 190, (#WEATHERS + 1) * (ITEM_H + ITEM_GAP) + ITEM_GAP, 456)
+        local anyBtn = button("Any weather", 8, ITEM_GAP, 174, ITEM_H, DARK, weatherMenu, 21)
+        local weatherBtns = {}
+        for i, w in ipairs(WEATHERS) do
+            weatherBtns[w] = button(w, 8, ITEM_GAP + i * (ITEM_H + ITEM_GAP), 174, ITEM_H, DARK, weatherMenu, 21)
+        end
+
+        local function refreshWeatherPick()
+            local n, last = 0, nil
+            for _, w in ipairs(WEATHERS) do
+                local on = Infinite.weathers[w:lower()] == true
+                if on then n += 1; last = w end
+                weatherBtns[w].BackgroundColor3 = on and GREEN or DARK
+                weatherBtns[w].Text = (on and "[x] " or "[  ] ") .. w
+            end
+            anyBtn.BackgroundColor3 = (n == 0) and GREEN or DARK
+            if n == 0 then
+                weatherBtn.Text = "Weather: Any"
+            elseif n == 1 then
+                weatherBtn.Text = "Weather: " .. last
+            else
+                weatherBtn.Text = ("Weather: %d selected"):format(n)
+            end
+        end
+
+        for _, w in ipairs(WEATHERS) do
+            weatherBtns[w].MouseButton1Click:Connect(function()
+                local k = w:lower()
+                if Infinite.weathers[k] then Infinite.weathers[k] = nil else Infinite.weathers[k] = true end
+                refreshWeatherPick()
+                Settings.save()
+            end)
+        end
+        anyBtn.MouseButton1Click:Connect(function()
+            Infinite.weathers = {}
+            refreshWeatherPick()
+            Settings.save()
+        end)
+        weatherBtn.MouseButton1Click:Connect(function()
+            weatherMenu.Visible = not weatherMenu.Visible
+        end)
+        refreshWeatherPick()
+
+        -- ---- weather detection ----
+        -- Empty selection = any weather triggers the give up
+        local function weatherAllowed(name)
+            if next(Infinite.weathers) == nil then return true end
+            return Infinite.weathers[tostring(name or ""):lower()] == true
+        end
+
+        -- Reads PlayerGui.WeatherGui.WeatherIndicator: WeatherName "[ Void ]" + TimerLabel "Time Remaining: 268".
+        -- (EventIndicator is a different thing, e.g. "[ Release Event ]", and is ignored.)
+        local function scanWeather()
+            local pg = player:FindFirstChild("PlayerGui")
+            local wg = pg and pg:FindFirstChild("WeatherGui")
+            local ind = wg and wg:FindFirstChild("WeatherIndicator")
+            if not ind then return nil end
+            local nameL, timerL = ind:FindFirstChild("WeatherName"), ind:FindFirstChild("TimerLabel")
+            if not (nameL and timerL and shown(nameL) and shown(timerL)) then return nil end
+            local n = clean(nameL.Text):match("^%s*%[%s*(.-)%s*%]%s*$")
+            local secs = tonumber(clean(timerL.Text):match("(%d+)"))
+            if n and n ~= "" and secs and secs > 0 then return n end
+            return nil
+        end
+
+        -- ---- give up ----
+        -- Method 1: press the game's own "Give up" button (fires its real click handlers)
+        -- Method 2 (fallback): fire EndTowerRemote directly
+        local function giveUp()
+            Infinite.lastGiveUp = os.clock()
+            Infinite.floor = 1 -- the game restarts the run by itself
+            local b = findButton(function(t) return t:find("give up", 1, true) ~= nil end)
+            if b and activateButton(b) then
+                task.delay(0.6, confirmDialog)
+                return "button"
+            elseif Remotes.EndTower then
+                Remotes.EndTower:FireServer(CFG.END_ARG)
+                return "remote"
+            end
+        end
+
+        -- ---- wiring ----
+        local function setPop(on)
+            Infinite.on = on
+            popBtn.Text = on and "Pop: ON" or "Pop: OFF"
+            popBtn.BackgroundColor3 = on and GREEN or RED
+            Settings.save()
+        end
+        Infinite.setPop = setPop
+
+        popBtn.MouseButton1Click:Connect(function() setPop(not Infinite.on) end)
+
+        minBox.FocusLost:Connect(function()
+            local n = tonumber(minBox.Text)
+            if n then Infinite.minFloor = math.max(1, math.floor(n)) end -- no upper limit
+            minBox.Text = tostring(Infinite.minFloor)
+            Settings.save()
+        end)
+
+        -- Every second while Pop is ON: reads the weather and shows why it does (or doesn't) give up
+        task.spawn(function()
+            while gui.Parent do
+                task.wait(1)
+                if Infinite.on then
+                    local n = scanWeather()
+                    local why
+                    if not n then
+                        why = "no weather"
+                    elseif not weatherAllowed(n) then
+                        why = "not selected"
+                    elseif Infinite.floor < Infinite.minFloor then
+                        why = "floor<min"
+                    elseif os.clock() - Infinite.lastGiveUp < 8 then
+                        why = "cooldown"
+                    else
+                        why = "GIVE UP"
+                        giveUp()
+                    end
+                    statusL.Text = ("%s | F%d | %s"):format(n or "-", Infinite.floor, why)
+                end
+            end
+        end)
+
+        -- called by the BattleEnd router: returns true for every result that is NOT the Halloween Tower.
+        -- Only tracks the current floor (needed for the "min floor" check).
+        Infinite.onBattleEnd = function(data)
+            if data.tower == "halloween" and data.mode == "infinite_room" then return false end
+            local fl = tonumber(data.floor)
+            if os.clock() - Infinite.lastGiveUp < 10 or LOSS[tostring(data.result):lower()] then
+                Infinite.floor = 1 -- run ended (our give up or a loss): the next run starts at floor 1
+            elseif fl then
+                Infinite.floor = fl + 1
+            end
+            logEnd("infinite", data)
+            return true
+        end
+    end
+
+    -- =====================================================================
+    -- == 12. BATTLEEND ROUTER + RESTORE OF THE SAVED SWITCHES
+    -- =====================================================================
+    -- 1) a boss fight started by Auto Boss  2) the Infinite Tower  3) the Halloween Tower
+    Remotes.BattleEnd.OnClientEvent:Connect(function(data)
+        if type(data) ~= "table" then return end
+        if Boss.onBattleEnd(data) then return end
+        if Infinite.onBattleEnd(data) then return end
+        Tower.onBattleEnd(data)
+    end)
+
+    -- Restore the Auto / Pop switches a few seconds after launch (the game needs to be loaded),
+    -- then start saving. Saving only starts after the restore, so a click made during
+    -- the delay cannot overwrite the saved state.
+    task.delay(CFG.RESTORE_DELAY, function()
+        if not gui.Parent then return end
+        local d = Settings.data
+        if d.autoCandy == true and not Candy.auto then Candy.setAuto(true) end
+        if d.autoTower == true and not Tower.auto then Tower.startAuto() end
+        if d.autoBoss == true and not Boss.auto then Boss.setAuto(true) end
+        if d.pop == true and not Infinite.on then Infinite.setPop(true) end
+        Settings.armed = true
+        Settings.save()
+    end)
+end
+
+-- =========================================================================
+-- == 13. START-UP + EMBEDDED ICON
+-- =========================================================================
+-- Puppy icon (base64 JPEG). It is written to a local file and loaded with getcustomasset.
+ICON_B64 = [[
 /9j/4AAQSkZJRgABAQAAAQABAAD/2wCEAAkGBwgICggICAgICAgICRYGCQkJCRsICQYWIB0iIiAdHx8kKC0sJCYxJx8fLT8tMTUw
 Mz0zIyszRj8sNy0tLisBCgoKDQ0NDg0NDysZFRkrKystKysrKysrKysrLSsrKysrKysrKysrKysrKysrKysrKysrKy0rKy0tKysr
 KysrK//AABEIAPAA8AMBIgACEQEDEQH/xAAcAAACAgMBAQAAAAAAAAAAAAADBAIFAQYHAAj/xABBEAACAQMCBAMFBgQEBgEFAAAB
@@ -216,621 +2119,8 @@ i8Z9hxGuI6U100gIVAnSx7AGjXCzAkSYngyGPCNX5mdfP40xpo5Jkhi05ZSNpCxxwNShjwCySI0rOOIT
 O6WTRM8mn1ExjKqVYZFlkA73+VF0sen1ChVdRCvNFdsnk+VUsiT8QLIsYSRbPKo4jVZwiLSqGQDlWwZV5x8aBiSRppArKbpyLsSh
 9bUQtZbS6lA492KOMKxpMLHNjJLrCm9wpaxX6VYeFaU6p+Bo4U1bA3uouPqd6nU8Ov/Z
 ]]
-    local function b64decode(data)
-        local alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
-        local map = {}
-        for i = 1, #alphabet do map[alphabet:byte(i)] = i - 1 end
-        local out, buf, bits = {}, 0, 0
-        for i = 1, #data do
-            local v = map[data:byte(i)]
-            if v then
-                buf = buf * 64 + v
-                bits += 6
-                if bits >= 8 then
-                    bits -= 8
-                    local byte = math.floor(buf / 2 ^ bits)
-                    buf = buf - byte * 2 ^ bits
-                    out[#out + 1] = string.char(byte)
-                end
-            end
-        end
-        return table.concat(out)
-    end
-    if ICON_ID == "" then
-        pcall(function()
-            if writefile and getcustomasset then
-                writefile("pibblehub_icon.jpg", b64decode(ICON_B64))
-                ICON_ID = getcustomasset("pibblehub_icon.jpg")
-            end
-        end)
-    end
-    local toggle
-    if ICON_ID ~= "" then
-        toggle = Instance.new("ImageButton")
-        toggle.Image = ICON_ID
-        toggle.ScaleType = Enum.ScaleType.Crop
-    else
-        toggle = Instance.new("TextButton")
-        toggle.Font = FONT
-        toggle.TextSize = 22
-        toggle.TextColor3 = ORANGE
-        toggle.Text = "P"
-    end
-    toggle.Name = "ToggleButton"
-    toggle.Size = UDim2.fromOffset(44, 44)
-    toggle.Position = UDim2.new(0, 30, 0.3, -52)
-    toggle.BackgroundColor3 = Color3.fromRGB(26, 14, 38)
-    toggle.BorderSizePixel = 0
-    toggle.Active = true
-    toggle.Draggable = true
-    toggle.ZIndex = 50
-    toggle.Parent = gui
-    local toggleCorner = Instance.new("UICorner", toggle)
-    toggleCorner.CornerRadius = UDim.new(0, 12)
-    local toggleStroke = Instance.new("UIStroke", toggle)
-    toggleStroke.Color = ORANGE
-    toggleStroke.Thickness = 2
-    toggle.MouseButton1Click:Connect(function()
-        main.Visible = not main.Visible
-    end)
 
-    local function label(text, y, color, size)
-        local l = Instance.new("TextLabel")
-        l.Size = UDim2.new(1, -20, 0, 20)
-        l.Position = UDim2.fromOffset(10, y)
-        l.BackgroundTransparency = 1
-        l.Font = FONT
-        l.TextSize = size or 16
-        l.TextColor3 = color or Color3.new(1, 1, 1)
-        l.TextXAlignment = Enum.TextXAlignment.Left
-        l.Text = text
-        l.ZIndex = 5
-        l.Parent = main
-        return l
-    end
-
-    local function button(text, x, y, w, h, color, parentFrame, z)
-        local b = Instance.new("TextButton")
-        b.Size = UDim2.fromOffset(w, h)
-        b.Position = UDim2.fromOffset(x, y)
-        b.BackgroundColor3 = color
-        b.BorderSizePixel = 0
-        b.Font = FONT
-        b.TextSize = 15
-        b.TextColor3 = Color3.new(1, 1, 1)
-        b.Text = text
-        b.ZIndex = z or 5
-        b.Parent = parentFrame or main
-        Instance.new("UICorner", b)
-        return b
-    end
-
-    label("PibbleHub", 5, ORANGE, 20)
-
-    -- Candy section
-    label("Candy Collector", 30, ORANGE)
-    local status = label("Status: idle", 50)
-    local timer = label("Respawn: -", 70)
-    local count = label("Collected: 0", 90)
-    local goBtn = button("Collect now", 10, 114, 105, 26, BLUE)
-    local autoBtn = button("Auto: OFF", 125, 114, 115, 26, RED)
-
-    -- Tower section
-    label("Halloween Tower", 152, ORANGE)
-    local floorLbl = label("Floors 1-5", 172)
-    local towerStatus = label("Tower: idle", 192)
-
-    local minusBtn = button("-", 10, 218, 36, 28, DARK)
-    local floorBox = Instance.new("TextBox")
-    floorBox.Size = UDim2.fromOffset(122, 28)
-    floorBox.Position = UDim2.fromOffset(52, 218)
-    floorBox.BackgroundColor3 = Color3.fromRGB(45, 30, 65)
-    floorBox.BorderSizePixel = 0
-    floorBox.Font = FONT
-    floorBox.TextSize = 16
-    floorBox.TextColor3 = Color3.new(1, 1, 1)
-    floorBox.PlaceholderText = "Floor (1-500)"
-    floorBox.PlaceholderColor3 = Color3.fromRGB(150, 140, 170)
-    floorBox.ClearTextOnFocus = true
-    floorBox.Text = "1"
-    floorBox.ZIndex = 5
-    floorBox.Parent = main
-    Instance.new("UICorner", floorBox)
-    local plusBtn = button("+", 180, 218, 36, 28, DARK)
-
-    local function firstFloor(s) return (s - 1) * 5 + 1 end
-
-    local function setStage(s)
-        stage = math.clamp(math.floor(s), 1, MAX_STAGE)
-        local a = firstFloor(stage)
-        floorBox.Text = tostring(a)
-        floorLbl.Text = ("Floors %d-%d"):format(a, a + 4)
-    end
-
-    local function readBox()
-        local n = tonumber(floorBox.Text)
-        if n then setStage(math.ceil(math.clamp(math.floor(n), 1, MAX_FLOOR) / 5)) end
-    end
-
-    floorBox.FocusLost:Connect(function()
-        local n = tonumber(floorBox.Text)
-        if n then readBox() else setStage(stage) end
-    end)
-
-    minusBtn.MouseButton1Click:Connect(function() setStage(stage - 1) end)
-    plusBtn.MouseButton1Click:Connect(function() setStage(stage + 1) end)
-
-    local startBtn = button("Start", 10, 258, 105, 28, BLUE)
-    local towerAutoBtn = button("Auto: OFF", 125, 258, 115, 28, RED)
-
-    -- Infinite Tower section (separate from the Halloween Tower)
-    label("Infinite Tower", 298, ORANGE)
-    local infStatus = label("Auto give up: idle", 318)
-    local wLabel = button("Weather: Any", 10, 342, 230, 28, DARK)
-    local popBtn = button("Pop: OFF", 10, 378, 105, 28, RED)
-    local minBox = Instance.new("TextBox")
-    minBox.Size = UDim2.fromOffset(115, 28)
-    minBox.Position = UDim2.fromOffset(125, 378)
-    minBox.BackgroundColor3 = Color3.fromRGB(45, 30, 65)
-    minBox.BorderSizePixel = 0
-    minBox.Font = FONT
-    minBox.TextSize = 15
-    minBox.TextColor3 = Color3.new(1, 1, 1)
-    minBox.PlaceholderText = "Min floor"
-    minBox.PlaceholderColor3 = Color3.fromRGB(150, 140, 170)
-    minBox.ClearTextOnFocus = true
-    minBox.Text = "1"
-    minBox.ZIndex = 5
-    minBox.Parent = main
-    Instance.new("UICorner", minBox)
-
-    -- ========== Weather menu (opens to the right of the main window) ==========
-    local ITEM_H, ITEM_GAP = 28, 4
-    local menuH = (#WEATHERS + 1) * (ITEM_H + ITEM_GAP) + ITEM_GAP
-    local weatherMenu = Instance.new("Frame")
-    weatherMenu.Size = UDim2.fromOffset(190, menuH)
-    weatherMenu.Position = UDim2.fromOffset(258, 304)
-    weatherMenu.BackgroundColor3 = Color3.fromRGB(36, 22, 52)
-    weatherMenu.BorderSizePixel = 0
-    weatherMenu.Visible = false
-    weatherMenu.ZIndex = 20
-    weatherMenu.Parent = main
-    Instance.new("UICorner", weatherMenu)
-
-    local anyBtn = button("Any weather", 8, ITEM_GAP, 174, ITEM_H, DARK, weatherMenu, 21)
-    local weatherBtns = {}
-    for i, w in ipairs(WEATHERS) do
-        local y = ITEM_GAP + i * (ITEM_H + ITEM_GAP)
-        weatherBtns[w] = button(w, 8, y, 174, ITEM_H, DARK, weatherMenu, 21)
-    end
-
-    local function refreshWeatherPick()
-        local n, last = 0, nil
-        for _, w in ipairs(WEATHERS) do
-            local on = selected[w:lower()] == true
-            if on then n += 1; last = w end
-            weatherBtns[w].BackgroundColor3 = on and GREEN or DARK
-            weatherBtns[w].Text = (on and "[x] " or "[  ] ") .. w
-        end
-        anyBtn.BackgroundColor3 = (n == 0) and GREEN or DARK
-        if n == 0 then
-            wLabel.Text = "Weather: Any"
-        elseif n == 1 then
-            wLabel.Text = "Weather: " .. last
-        else
-            wLabel.Text = ("Weather: %d selected"):format(n)
-        end
-    end
-
-    for _, w in ipairs(WEATHERS) do
-        weatherBtns[w].MouseButton1Click:Connect(function()
-            local k = w:lower()
-            if selected[k] then selected[k] = nil else selected[k] = true end
-            refreshWeatherPick()
-        end)
-    end
-    anyBtn.MouseButton1Click:Connect(function()
-        selected = {}
-        refreshWeatherPick()
-    end)
-    wLabel.MouseButton1Click:Connect(function()
-        weatherMenu.Visible = not weatherMenu.Visible
-    end)
-    refreshWeatherPick()
-
-    setStage(1)
-
-    -- ========== Tower logic ==========
-    local function fireBind(name, ...)
-        local pg = player:FindFirstChild("PlayerGui")
-        local b = pg and pg:FindFirstChild(name)
-        if b and b:IsA("BindableEvent") then b:Fire(...) end
-    end
-
-    local function enterStage(s, isAuto)
-        local m = firstFloor(s)
-        local suffix = SLOT == 2 and "2" or ""
-        -- same calls the game's own Enter button makes
-        fireBind("ResetBattleFloor" .. suffix, m, "infinite_room")
-        fireBind("StartInfiniteRoomBattle" .. suffix, m, "halloween", isAuto or nil)
-        StartBattle:FireServer("infinite_room", {
-            tower = "halloween",
-            milestone = m,
-            slot = SLOT,
-        })
-        towerStatus.Text = ("Tower: started %d-%d"):format(m, m + 4)
-    end
-
-    -- Infinite Tower "Give up": defined below (needs clean/shown helpers)
-    local giveUp
-
-    -- Weather detection on screen (see scanWeather below)
-    local function clean(t) return (tostring(t):gsub("<[^>]+>", "")) end
-
-    local function shown(o)
-        local x = o
-        while x and x ~= game do
-            if x:IsA("ScreenGui") then
-                if not x.Enabled then return false end
-            elseif x:IsA("GuiObject") then
-                if not x.Visible then return false end
-            end
-            x = x.Parent
-        end
-        return true
-    end
-
-    -- Reads PlayerGui.WeatherGui.WeatherIndicator: WeatherName "[ Void ]" + TimerLabel "Time Remaining: 268".
-    -- (EventIndicator is a different thing, e.g. "[ Release Event ]", and is ignored.)
-    local function scanWeather()
-        local pg = player:FindFirstChild("PlayerGui")
-        local wg = pg and pg:FindFirstChild("WeatherGui")
-        local ind = wg and wg:FindFirstChild("WeatherIndicator")
-        if not ind then return nil end
-        local nameL, timerL = ind:FindFirstChild("WeatherName"), ind:FindFirstChild("TimerLabel")
-        if not (nameL and timerL and shown(nameL) and shown(timerL)) then return nil end
-        local n = clean(nameL.Text):match("^%s*%[%s*(.-)%s*%]%s*$")
-        local secs = tonumber(clean(timerL.Text):match("(%d+)"))
-        if n and n ~= "" and secs and secs > 0 then return n end
-        return nil
-    end
-
-    -- ===== Give up =====
-    -- Method 1: press the game's own "Give up" button (fires its real click handlers)
-    -- Method 2 (fallback): fire EndTowerRemote directly
-    local function btnText(o)
-        if o:IsA("TextButton") or o:IsA("TextLabel") then return clean(o.Text):lower() end
-        return ""
-    end
-
-    local function findButton(pred)
-        local pg = player:FindFirstChild("PlayerGui")
-        if not pg then return nil end
-        local best
-        for _, d in ipairs(pg:GetDescendants()) do
-            if d ~= gui and not d:IsDescendantOf(gui) and pred(btnText(d)) then
-                -- a label inside a button: use the button
-                local b = d
-                if not (b:IsA("TextButton") or b:IsA("ImageButton")) then
-                    b = d:FindFirstAncestorWhichIsA("TextButton") or d:FindFirstAncestorWhichIsA("ImageButton")
-                end
-                if b then
-                    if shown(b) then return b end
-                    best = best or b
-                end
-            end
-        end
-        return best
-    end
-
-    local function activateButton(b)
-        local fired = false
-        for _, sig in ipairs({"MouseButton1Click", "Activated"}) do
-            if typeof(firesignal) == "function" then
-                if pcall(function() firesignal(b[sig]) end) then fired = true end
-            elseif typeof(getconnections) == "function" then
-                pcall(function()
-                    for _, c in ipairs(getconnections(b[sig])) do c:Fire(); fired = true end
-                end)
-            end
-            if fired then break end
-        end
-        return fired
-    end
-
-    -- some games ask "are you sure?" after Give up: press Yes / Confirm if it appears
-    local function confirmDialog()
-        local b = findButton(function(t)
-            return t == "yes" or t == "confirm" or t == "give up!" or t:find("^yes[%s%p]") ~= nil
-        end)
-        if b and shown(b) then activateButton(b) end
-    end
-
-    giveUp = function()
-        lastGiveUp = os.clock()
-        infFloor = 1 -- the game restarts the run by itself
-        local method
-        local b = findButton(function(t) return t:find("give up", 1, true) ~= nil end)
-        if b and activateButton(b) then
-            method = "button"
-            task.delay(0.6, confirmDialog)
-        elseif EndTower then
-            EndTower:FireServer(END_ARG)
-            method = "remote"
-        end
-        return method
-    end
-
-    -- Every second while Pop is ON: reads the weather and shows why it does (or doesn't) give up
-    task.spawn(function()
-        while gui.Parent do
-            task.wait(1)
-            if popOn then
-                local n = scanWeather()
-                weatherName = n
-                local why
-                if not n then
-                    why = "no weather"
-                elseif not weatherAllowed(n) then
-                    why = "not selected"
-                elseif infFloor < minPopFloor then
-                    why = "floor<min"
-                elseif os.clock() - lastGiveUp < 8 then
-                    why = "cooldown"
-                else
-                    why = "GIVE UP"
-                    giveUp()
-                end
-                infStatus.Text = ("%s | F%d | %s"):format(n or "-", infFloor, why)
-            end
-        end
-    end)
-
-    local function stopTowerAuto(msg)
-        towerAuto = false
-        if restoreTowerGui then restoreTowerGui() end
-        towerAutoBtn.Text = "Auto: OFF"
-        towerAutoBtn.BackgroundColor3 = RED
-        if msg then towerStatus.Text = msg end
-    end
-
-    -- hides the game's tower UI (used while auto runs so it doesn't pop up again)
-    local hiddenObjs = {}
-
-    local function hideObj(o)
-        if o:IsA("ScreenGui") then
-            if o.Enabled then o.Enabled = false; hiddenObjs[o] = true end
-        elseif o:IsA("GuiObject") then
-            if o.Visible then o.Visible = false; hiddenObjs[o] = true end
-        end
-    end
-
-    local towerPanel, lastScan = nil, 0
-
-    -- Finds the tower window only: the smallest frame that contains BOTH the
-    -- "Enter Tower" button and the "Floors x-y" list. Other UIs are never matched.
-    local function findTowerPanel(pg)
-        for _, d in ipairs(pg:GetDescendants()) do
-            if (d:IsA("TextButton") or d:IsA("TextLabel"))
-                and tostring(d.Text):lower():find("enter tower", 1, true) then
-                local a = d.Parent
-                while a and not a:IsA("ScreenGui") do
-                    if a:IsA("GuiObject") then
-                        for _, x in ipairs(a:GetDescendants()) do
-                            if (x:IsA("TextLabel") or x:IsA("TextButton"))
-                                and tostring(x.Text):find("^%s*[Ff]loors?%s+%d") then
-                                return a
-                            end
-                        end
-                    end
-                    a = a.Parent
-                end
-            end
-        end
-    end
-
-    local function hideTowerGui()
-        pcall(function()
-            local pg = player:FindFirstChild("PlayerGui")
-            if not pg then return end
-            -- the tower's own gui, if it exists under this name
-            local g = pg:FindFirstChild("HalloweenTowerGui")
-            if g then hideObj(g) end
-            -- the tower window found by content (cached, rescanned at most once per second)
-            if not (towerPanel and towerPanel.Parent) and os.clock() - lastScan > 1 then
-                lastScan = os.clock()
-                towerPanel = findTowerPanel(pg)
-            end
-            if towerPanel and towerPanel.Parent then hideObj(towerPanel) end
-        end)
-    end
-
-    restoreTowerGui = function()
-        for o in pairs(hiddenObjs) do
-            if o.Parent then
-                pcall(function()
-                    if o:IsA("ScreenGui") then o.Enabled = true else o.Visible = true end
-                end)
-            end
-            hiddenObjs[o] = nil
-        end
-    end
-
-    -- The server answers OpenHalloweenTower with (clearedFloor, slot, pausedRun)
-    -- (keeps SLOT up to date when the game opens the tower UI)
-    OpenTower.OnClientEvent:Connect(function(cleared, slot)
-        SLOT = (slot == 2) and 2 or 1
-        towerStatus.Text = ("Tower: UI open (cleared %s, slot %d)"):format(tostring(cleared or 0), SLOT)
-        if towerAuto then task.defer(hideTowerGui) end
-    end)
-
-    popBtn.MouseButton1Click:Connect(function()
-        popOn = not popOn
-        popBtn.Text = popOn and "Pop: ON" or "Pop: OFF"
-        popBtn.BackgroundColor3 = popOn and GREEN or RED
-    end)
-
-    minBox.FocusLost:Connect(function()
-        local n = tonumber(minBox.Text)
-        if n then minPopFloor = math.max(1, math.floor(n)) end -- no upper limit
-        minBox.Text = tostring(minPopFloor)
-    end)
-
-    startBtn.MouseButton1Click:Connect(function()
-        readBox()
-        enterStage(stage, false)
-    end)
-
-    towerAutoBtn.MouseButton1Click:Connect(function()
-        if towerAuto then
-            stopTowerAuto("Tower: auto stopped")
-        else
-            readBox()
-            towerAuto = true
-            towerAutoBtn.Text = "Auto: ON"
-            towerAutoBtn.BackgroundColor3 = GREEN
-            enterStage(stage, true)
-            -- keep the tower UI hidden while auto runs
-            task.spawn(function()
-                while towerAuto and gui.Parent do
-                    hideTowerGui()
-                    task.wait(0.25)
-                end
-            end)
-        end
-    end)
-
-    -- Any of these results counts as a loss -> retry the SAME stage
-    local LOSS = { lose = true, loss = true, lost = true, defeat = true, fail = true, failed = true }
-
-    BattleEnd.OnClientEvent:Connect(function(data)
-        if type(data) ~= "table" then return end
-        local res = tostring(data.result):lower()
-
-        -- Not the Halloween Tower = Infinite Tower: only track the floor for the auto give up
-        if data.tower ~= "halloween" or data.mode ~= "infinite_room" then
-            local fl = tonumber(data.floor)
-            if os.clock() - lastGiveUp < 10 or LOSS[res] then
-                infFloor = 1 -- run ended (our give up or a loss): the next run starts at floor 1
-            elseif fl then
-                infFloor = fl + 1
-            end
-            pcall(function() print("[PibbleHub] BattleEnd (infinite):", game:GetService("HttpService"):JSONEncode(data)) end)
-            return
-        end
-
-        towerStatus.Text = ("Tower: floor %s %s"):format(tostring(data.floor), tostring(data.result))
-        if not towerAuto then return end
-        task.defer(hideTowerGui)
-
-        -- loss: relaunch the same stage (stage is not modified)
-        if LOSS[tostring(data.result):lower()] then
-            task.delay(AUTO_DELAY, function()
-                if towerAuto and gui.Parent then enterStage(stage, true) end
-            end)
-            return
-        end
-
-        if data.result ~= "milestone_complete" then return end -- single floor won, group continues
-
-        -- win: stay on the SAME stage (stage is not modified), relaunch it
-        task.delay(AUTO_DELAY, function()
-            if towerAuto and gui.Parent then enterStage(stage, true) end
-        end)
-    end)
-
-    -- ========== Candy logic ==========
-    local function refresh()
-        Request:FireServer()
-        task.wait(1.5)
-    end
-
-    local function run()
-        if busy then return end
-        busy = true
-        local hrp = player.Character and player.Character:FindFirstChild("HumanoidRootPart")
-        if not hrp then
-            status.Text = "Status: character not found"
-            busy = false
-            return
-        end
-
-        local back = hrp.CFrame
-        local tried = {}
-
-        local function confirm()
-            for id in pairs(tried) do
-                local ready = state[id]
-                if ready and ready > os.time() + offset then
-                    total += 1
-                    tried[id] = nil
-                end
-            end
-            count.Text = "Collected: " .. total
-        end
-
-        for attempt = 1, 3 do
-            status.Text = "Status: updating (" .. attempt .. "/3)"
-            refresh()
-            confirm()
-            nextT = nil
-            local pending = 0
-
-            for _, model in ipairs(CS:GetTagged("PickupCandy")) do
-                local id = model:GetAttribute("CandyId")
-                if type(id) == "string" then
-                    local ready = state[id]
-                    if ready and ready > os.time() + offset then
-                        nextT = nextT and math.min(nextT, ready) or ready
-                    else
-                        local okBox, cf = pcall(function() return model:GetBoundingBox() end)
-                        if okBox then
-                            pending += 1
-                            tried[id] = true
-                            status.Text = "Collecting: " .. id
-                            hrp.CFrame = CFrame.new(cf.Position + Vector3.new(0, 12, 0))
-                            task.wait(0.4)
-                            hrp.CFrame = CFrame.new(cf.Position)
-                            task.wait(0.4)
-                        end
-                    end
-                end
-            end
-
-            if pending == 0 then break end
-        end
-
-        refresh()
-        confirm()
-        for id in pairs(tried) do print("Failed:", id) end
-        hrp.CFrame = back
-        status.Text = auto and "Status: auto running" or "Status: done"
-        busy = false
-    end
-
-    goBtn.MouseButton1Click:Connect(function() task.spawn(run) end)
-    autoBtn.MouseButton1Click:Connect(function()
-        auto = not auto
-        autoBtn.Text = auto and "Auto: ON" or "Auto: OFF"
-        autoBtn.BackgroundColor3 = auto and GREEN or RED
-    end)
-
-    task.spawn(function()
-        local t = 30
-        while gui.Parent do
-            task.wait(1)
-            t += 1
-            if nextT then
-                local left = math.max(0, nextT - (os.time() + offset))
-                timer.Text = ("Respawn: %dm %02ds"):format(left // 60, left % 60)
-            end
-            if auto and not busy and t >= 30 then
-                t = 0
-                task.spawn(run)
-            end
-        end
-    end)
-end, debug.traceback)
+local ok, err = xpcall(runHub, debug.traceback)
 
 if not ok then
     warn("PibbleHub error:", err)
